@@ -1,0 +1,67 @@
+{
+    "YouTube": {
+        "font_family": "Arial",
+        "font_size": 48,
+        "primary_color": "#FFFFFF",
+        "outline_color": "#000000",
+        "outline_thickness": 2,
+        "bold": false,
+        "italic": false,
+        "background_enabled": false,
+        "background_color": "#000000",
+        "background_opacity": 0.5,
+        "position": "bottom"
+    },
+    "Netflix": {
+        "font_family": "Consolas",
+        "font_size": 42,
+        "primary_color": "#FFFFFF",
+        "outline_color": "#000000",
+        "outline_thickness": 1,
+        "bold": false,
+        "italic": false,
+        "background_enabled": true,
+        "background_color": "#000000",
+        "background_opacity": 0.7,
+        "position": "bottom"
+    },
+    "TikTok Bold": {
+        "font_family": "Arial Black",
+        "font_size": 56,
+        "primary_color": "#FFFF00",
+        "outline_color": "#000000",
+        "outline_thickness": 3,
+        "bold": true,
+        "italic": false,
+        "background_enabled": false,
+        "background_color": "#000000",
+        "background_opacity": 0.5,
+        "position": "center"
+    },
+    "Minimal": {
+        "font_family": "Arial",
+        "font_size": 36,
+        "primary_color": "#D3D3D3",
+        "outline_color": "#000000",
+        "outline_thickness": 0,
+        "bold": false,
+        "italic": false,
+        "background_enabled": false,
+        "background_color": "#000000",
+        "background_opacity": 0.5,
+        "position": "bottom"
+    },
+    "Cinematic": {
+        "font_family": "Georgia",
+        "font_size": 44,
+        "primary_color": "#F0E68C",
+        "outline_color": "#000000",
+        "outline_thickness": 2,
+        "bold": false,
+        "italic": false,
+        "background_enabled": true,
+        "background_color": "#000000",
+        "background_opacity": 0.5,
+        "position": "bottom"
+    }
+}

@@ -23,25 +23,28 @@ class Transcriber:
         audio_path,
         language=None,
         voice_adjustment="normal",
+        word_timestamps=False,
         on_progress=None,
         on_complete=None,
         on_error=None,
     ):
         """Run transcription in background thread.
         on_progress(float) - 0.0 to 1.0
-        on_complete(list[dict]) - list of {index, start, end, text}
+        on_complete(list[dict]) - list of {index, start, end, text, words?}
         on_error(str) - error message
         """
         self._cancel = False
         thread = threading.Thread(
             target=self._transcribe_worker,
-            args=(audio_path, language, voice_adjustment, on_progress, on_complete, on_error),
+            args=(audio_path, language, voice_adjustment, word_timestamps,
+                  on_progress, on_complete, on_error),
             daemon=True,
         )
         thread.start()
         return thread
 
-    def _transcribe_worker(self, audio_path, language, voice_adjustment, on_progress, on_complete, on_error):
+    def _transcribe_worker(self, audio_path, language, voice_adjustment, word_timestamps,
+                           on_progress, on_complete, on_error):
         try:
             if self.model is None:
                 self.load_model(self.model_size)
@@ -50,6 +53,9 @@ class Transcriber:
                 "language": language,
                 "beam_size": 5,
             }
+
+            if word_timestamps:
+                transcribe_kwargs["word_timestamps"] = True
 
             adjustment = (voice_adjustment or "normal").lower()
             if adjustment == "low":
@@ -74,12 +80,20 @@ class Transcriber:
                 if self._cancel:
                     return
                 idx += 1
-                results.append({
+                entry = {
                     "index": idx,
                     "start": segment.start,
                     "end": segment.end,
                     "text": segment.text.strip(),
-                })
+                }
+
+                if word_timestamps and hasattr(segment, 'words') and segment.words:
+                    entry["words"] = [
+                        {"word": w.word, "start": w.start, "end": w.end}
+                        for w in segment.words
+                    ]
+
+                results.append(entry)
                 if on_progress and duration > 0:
                     on_progress(min(segment.end / duration, 1.0))
 

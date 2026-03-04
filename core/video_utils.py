@@ -1,5 +1,6 @@
 import cv2
 import os
+import subprocess
 from PIL import Image
 
 
@@ -49,6 +50,20 @@ def format_time(seconds: float) -> str:
     s = int(seconds % 60)
     ms = int((seconds % 1) * 1000)
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def extract_audio(video_path: str, output_path: str, format: str = "wav") -> str:
+    """Extract audio from video using FFmpeg. Returns output path."""
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-vn", "-acodec", "pcm_s16le" if format == "wav" else "libmp3lame",
+        "-ar", "16000", "-ac", "1",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg audio extraction failed: {result.stderr[:200]}")
+    return output_path
 
 
 def format_duration(seconds: float) -> str:

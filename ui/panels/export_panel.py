@@ -68,9 +68,20 @@ class ExportPanel(ctk.CTkFrame):
         )
         self.bilingual_check.grid(row=2, column=0, sticky="w", padx=SPACING["lg"], pady=(0, SPACING["sm"]))
 
+        # Speaker labels option (Feature 4)
+        self.speaker_labels_var = ctk.BooleanVar(value=False)
+        self.speaker_labels_check = ctk.CTkCheckBox(
+            sub_section, text="Include speaker labels", variable=self.speaker_labels_var,
+            font=ctk.CTkFont(family=ff, size=FONTS["small"][1]),
+            text_color=COLORS["text_secondary"],
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+            checkmark_color=COLORS["button_text"],
+        )
+        self.speaker_labels_check.grid(row=3, column=0, sticky="w", padx=SPACING["lg"], pady=(0, SPACING["sm"]))
+
         # Export button with download icon
         btn_frame = ctk.CTkFrame(sub_section, fg_color="transparent")
-        btn_frame.grid(row=3, column=0, sticky="ew", padx=SPACING["lg"], pady=(0, SPACING["md"]))
+        btn_frame.grid(row=4, column=0, sticky="ew", padx=SPACING["lg"], pady=(0, SPACING["md"]))
 
         self._download_icon = IconRenderer.get_colored("download", 16, "#FFFFFF")
 
@@ -205,11 +216,15 @@ class ExportPanel(ctk.CTkFrame):
 
         base_name = os.path.splitext(self.state.video_info.get("filename", "subtitles"))[0]
         bilingual = self.state.bilingual and self.bilingual_export_var.get()
+        include_speakers = self.speaker_labels_var.get()
+        speakers = getattr(self.state, 'speakers', {})
+        karaoke_mode = getattr(self.state, 'karaoke_mode', 'off')
         exported = []
 
         if self.srt_var.get():
             srt_path = os.path.join(out_dir, f"{base_name}.srt")
-            write_srt(self.state.subtitles, srt_path, bilingual=bilingual)
+            write_srt(self.state.subtitles, srt_path, bilingual=bilingual,
+                      include_speaker_labels=include_speakers, speakers=speakers)
             exported.append("SRT")
 
         if self.ass_var.get():
@@ -219,6 +234,11 @@ class ExportPanel(ctk.CTkFrame):
                 primary_style=self.state.primary_style,
                 secondary_style=self.state.secondary_style if bilingual else None,
                 bilingual=bilingual,
+                karaoke_mode=karaoke_mode,
+                speakers=speakers if include_speakers else None,
+                include_speaker_labels=include_speakers,
+                animation_style=getattr(self.state, 'animation_style', 'none'),
+                transition_duration=getattr(self.state, 'transition_duration', 0.30),
             )
             exported.append("ASS")
 
@@ -240,11 +260,20 @@ class ExportPanel(ctk.CTkFrame):
         import tempfile
         tmp_ass = os.path.join(tempfile.gettempdir(), "subtitle_burn_temp.ass")
         bilingual = self.state.bilingual and self.bilingual_export_var.get()
+        include_speakers = self.speaker_labels_var.get()
+        speakers = getattr(self.state, 'speakers', {})
+        karaoke_mode = getattr(self.state, 'karaoke_mode', 'off')
+
         write_ass(
             self.state.subtitles, tmp_ass,
             primary_style=self.state.primary_style,
             secondary_style=self.state.secondary_style if bilingual else None,
             bilingual=bilingual,
+            karaoke_mode=karaoke_mode,
+            speakers=speakers if include_speakers else None,
+            include_speaker_labels=include_speakers,
+            animation_style=getattr(self.state, 'animation_style', 'none'),
+            transition_duration=getattr(self.state, 'transition_duration', 0.30),
         )
 
         base = os.path.splitext(self.state.video_path)[0]

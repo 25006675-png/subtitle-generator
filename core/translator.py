@@ -1,7 +1,11 @@
 import threading
+import os
 from google import genai
+from dotenv import load_dotenv
 
-GEMINI_API_KEY = "AIzaSyBW6O65IRtTqlhM0Sjtz8IDcX-dzsKF1CU"
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 BATCH_SIZE = 50
 
 LANGUAGES = [
