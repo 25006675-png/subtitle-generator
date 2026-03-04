@@ -55,7 +55,8 @@ class AppState:
     popup_trail_count: int = 3             # Pop-up trailing words shown (0-5)
     wordbyw_entry_style: str = "instant"   # "instant", "fade", "pop"
     wordbyw_history_style: str = "full"    # "full", "dimmed"
-    classic_history_mode: str = "none"  # "none", "color", "box"
+    classic_active_marker: str = "color"   # "color" | "box" | "color_box"
+    classic_history_on: bool = False        # mirror active marker for spoken words
 
     # Feature 4: Multi-Speaker
     speakers: dict = field(default_factory=dict)  # {speaker_id: SpeakerInfo}
@@ -177,10 +178,14 @@ class AppState:
             self.wordbyw_history_style = v
             self.notify("wordbyw_history_style")
 
-    def set_classic_history_mode(self, v: str):
-        if v in ("none", "color", "box"):
-            self.classic_history_mode = v
-            self.notify("classic_history_mode")
+    def set_classic_active_marker(self, v: str):
+        if v in ("color", "box", "color_box"):
+            self.classic_active_marker = v
+            self.notify("classic_active_marker")
+
+    def set_classic_history_on(self, v: bool):
+        self.classic_history_on = bool(v)
+        self.notify("classic_history_on")
 
     def get_word_at_time(self, t: float):
         """Returns (SubtitleEntry, word_index) or (None, -1)."""

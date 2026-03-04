@@ -192,16 +192,21 @@ class VideoPreview(ctk.CTkFrame):
             )
             self._mpv_frame.grid(row=0, column=0, sticky="nsew")
 
-            # Subtitle overlay canvas placed over mpv frame via place()
+            # Subtitle overlay canvas is a child of _mpv_frame (not _video_container)
+            # so it is guaranteed to be pixel-identical in size to the mpv render
+            # target. Background is a "magic" colorkey colour (#010101 ≈ black)
+            # made transparent via WS_EX_LAYERED in _init_mpv, so the mpv video
+            # shows through wherever there is no subtitle text.
             self.subtitle_canvas = tk.Canvas(
-                self._video_container,
-                bg="#000000",
+                self._mpv_frame,
+                bg="#010101",
                 highlightthickness=0,
             )
             self.subtitle_canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
 
-            # Bind resize so subtitle overlay dimensions stay in sync
-            self._video_container.bind("<Configure>", self._on_resize)
+            # Bind resize to _mpv_frame so subtitle dimensions stay in sync
+            # with the actual mpv render area.
+            self._mpv_frame.bind("<Configure>", self._on_resize)
 
         else:
             # Fallback path: single canvas for video + subtitle composite
@@ -338,6 +343,22 @@ class VideoPreview(ctk.CTkFrame):
             player.volume = self._volume
             player.mute = self._is_muted
             self._mpv_player = player
+            # Make the subtitle overlay canvas transparent on Windows so the
+            # mpv video in _mpv_frame shows through its background pixels.
+            # WS_EX_LAYERED + LWA_COLORKEY treats all #010101 pixels as
+            # transparent; subtitles drawn in other colours remain visible.
+            if os.name == "nt":
+                try:
+                    import ctypes
+                    _hwnd = self.subtitle_canvas.winfo_id()
+                    _GWL_EXSTYLE = -20
+                    _WS_EX_LAYERED = 0x00080000
+                    _LWA_COLORKEY = 0x00000001
+                    _style = ctypes.windll.user32.GetWindowLongW(_hwnd, _GWL_EXSTYLE)
+                    ctypes.windll.user32.SetWindowLongW(_hwnd, _GWL_EXSTYLE, _style | _WS_EX_LAYERED)
+                    ctypes.windll.user32.SetLayeredWindowAttributes(_hwnd, 0x010101, 0, _LWA_COLORKEY)
+                except Exception:
+                    pass
             # Start the subtitle + scrubber update loops
             self._mpv_subtitle_tick()
             self._mpv_scrubber_tick()
@@ -373,7 +394,7 @@ class VideoPreview(ctk.CTkFrame):
             "video", "preview_time", "subtitles", "selected_subtitle",
             "style", "bilingual", "karaoke_mode", "speakers", "animation_style",
             "karaoke_highlight_color", "transition_duration", "classic_dimmed_opacity",
-            "classic_history_mode", "popup_scale", "popup_trail_count",
+            "classic_active_marker", "classic_history_on", "popup_scale", "popup_trail_count",
             "wordbyw_entry_style", "wordbyw_history_style", "subtitles_edited",
         ):
             return
@@ -393,8 +414,10 @@ class VideoPreview(ctk.CTkFrame):
             self._prev_word_index = -2
 
         if self._use_mpv:
-            if field == "preview_time" and not self._is_playing:
-                # Sync mpv position when state changes externally (e.g. subtitle-list click)
+            if field in ("preview_time", "selected_subtitle") and not self._is_playing:
+                # Sync mpv position for scrubber changes AND subtitle-list clicks.
+                # set_selected_subtitle() sets preview_time silently (no "preview_time"
+                # notification), so we must also handle "selected_subtitle" here.
                 t = self.state.preview_time
                 self._mpv_seek(t)
             self._mpv_force_subtitle_redraw()
@@ -577,7 +600,8 @@ class VideoPreview(ctk.CTkFrame):
             "transition_duration": getattr(self.state, "transition_duration", 0.30),
             "karaoke_highlight_color": getattr(self.state, "karaoke_highlight_color", "#FFFF00"),
             "classic_dimmed_opacity": getattr(self.state, "classic_dimmed_opacity", 0.5),
-            "classic_history_mode": getattr(self.state, "classic_history_mode", "none"),
+            "classic_active_marker": getattr(self.state, "classic_active_marker", "color"),
+            "classic_history_on": getattr(self.state, "classic_history_on", False),
             "popup_scale": getattr(self.state, "popup_scale", 1.5),
             "popup_trail_count": getattr(self.state, "popup_trail_count", 3),
             "wordbyw_entry_style": getattr(self.state, "wordbyw_entry_style", "instant"),
@@ -809,7 +833,8 @@ class VideoPreview(ctk.CTkFrame):
             "transition_duration": getattr(self.state, "transition_duration", 0.30),
             "karaoke_highlight_color": getattr(self.state, "karaoke_highlight_color", "#FFFF00"),
             "classic_dimmed_opacity": getattr(self.state, "classic_dimmed_opacity", 0.5),
-            "classic_history_mode": getattr(self.state, "classic_history_mode", "none"),
+            "classic_active_marker": getattr(self.state, "classic_active_marker", "color"),
+            "classic_history_on": getattr(self.state, "classic_history_on", False),
             "popup_scale": getattr(self.state, "popup_scale", 1.5),
             "popup_trail_count": getattr(self.state, "popup_trail_count", 3),
             "wordbyw_entry_style": getattr(self.state, "wordbyw_entry_style", "instant"),
@@ -1281,13 +1306,16 @@ class VideoPreview(ctk.CTkFrame):
                     font, text: str, x: int, y: int) -> Image.Image:
         if not getattr(style, "glow_enabled", False):
             return img
-        radius = max(1, getattr(style, "glow_radius", 5))
+        # Use a minimum radius of 8 so the halo extends visibly past the text edge.
+        radius = max(8, getattr(style, "glow_radius", 8))
         glow_color = self._hex_to_rgb(getattr(style, "glow_color", "#FFFFFF"))
 
+        # Draw text once at full alpha then blur — this produces a soft halo that
+        # radiates outward from the text boundary. Multiple passes saturate the
+        # center to an opaque solid blob and must be avoided.
         glow_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
         gd = ImageDraw.Draw(glow_layer)
-        for _ in range(3):
-            gd.text((x, y), text, font=font, fill=(*glow_color, 200))
+        gd.text((x, y), text, font=font, fill=(*glow_color, 255))
         blurred = glow_layer.filter(ImageFilter.GaussianBlur(radius))
 
         orig_mode = img.mode
@@ -1372,7 +1400,10 @@ class VideoPreview(ctk.CTkFrame):
         cur_x = start_x
 
         highlight_color = self._hex_to_rgb(params["karaoke_highlight_color"])
-        history_mode = params["classic_history_mode"]
+        active_marker = params["classic_active_marker"]   # "color" | "box" | "color_box"
+        history_on    = params["classic_history_on"]       # bool
+        use_color = "color" in active_marker
+        use_box   = "box"   in active_marker
         dimmed_a = int(params["classic_dimmed_opacity"] * 255)
         pr, pg, pb = self._hex_to_rgb(style.primary_color)
         dimmed_color = (int(pr * dimmed_a / 255), int(pg * dimmed_a / 255), int(pb * dimmed_a / 255))
@@ -1380,6 +1411,7 @@ class VideoPreview(ctk.CTkFrame):
         thickness = style.outline_thickness
         base_color = self._hex_to_rgb(style.primary_color)
 
+        # ── per-word background box (style panel toggle, independent of marker) ──
         if style.background_enabled:
             overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
             ov_draw = ImageDraw.Draw(overlay)
@@ -1396,7 +1428,8 @@ class VideoPreview(ctk.CTkFrame):
             img = Image.alpha_composite(img, overlay)
             draw = ImageDraw.Draw(img)
 
-        if history_mode == "box":
+        # ── highlight box marker (active_marker controls shape; history mirrors it) ──
+        if use_box:
             hl_overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
             hl_draw = ImageDraw.Draw(hl_overlay)
             pad = 5
@@ -1409,7 +1442,7 @@ class VideoPreview(ctk.CTkFrame):
                         [tmp_x - pad, y - 3, tmp_x + m["w"] + pad, y + m["h"] + 3],
                         radius=5, fill=(*highlight_color, 180),
                     )
-                elif is_spoken:
+                elif is_spoken and history_on:
                     hl_draw.rounded_rectangle(
                         [tmp_x - pad, y - 3, tmp_x + m["w"] + pad, y + m["h"] + 3],
                         radius=5, fill=(*highlight_color, 90),
@@ -1425,9 +1458,11 @@ class VideoPreview(ctk.CTkFrame):
             spoken = current_time >= m["end"]
 
             if active:
-                color = highlight_color
+                color = highlight_color if use_color else base_color
+            elif spoken and history_on:
+                color = highlight_color if use_color else base_color
             elif spoken:
-                color = highlight_color if history_mode == "color" else base_color
+                color = base_color
             else:
                 color = dimmed_color
 

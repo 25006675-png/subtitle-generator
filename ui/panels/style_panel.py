@@ -233,23 +233,40 @@ class StylePanel(ctk.CTkFrame):
         self.dimmed_val_label.grid(row=1, column=2, sticky="w", pady=(SPACING["xs"], 0))
 
         ctk.CTkLabel(
-            self.classic_settings, text="History:",
+            self.classic_settings, text="Active:",
             font=ctk.CTkFont(family=ff, size=FONTS["body"][1]),
             text_color=COLORS["text_secondary"],
         ).grid(row=2, column=0, padx=(SPACING["lg"], SPACING["md"]), pady=(SPACING["xs"], SPACING["xs"]))
 
-        self.history_mode_var = ctk.StringVar(value={"none": "None", "color": "Color", "box": "Box"}.get(
-            getattr(state, 'classic_history_mode', 'none'), "None"
-        ))
+        self.active_marker_var = ctk.StringVar(value={
+            "color": "Color", "box": "Box", "color_box": "Color+Box",
+        }.get(getattr(state, 'classic_active_marker', 'color'), "Color"))
         ctk.CTkSegmentedButton(
             self.classic_settings,
-            values=["None", "Color", "Box"],
-            variable=self.history_mode_var,
+            values=["Color", "Box", "Color+Box"],
+            variable=self.active_marker_var,
             font=ctk.CTkFont(family=ff, size=FONTS["small"][1]),
             selected_color=COLORS["accent"],
             selected_hover_color=COLORS["accent_hover"],
-            command=self._on_history_mode_change,
+            command=self._on_active_marker_change,
         ).grid(row=2, column=1, columnspan=2, sticky="ew", padx=(0, SPACING["lg"]), pady=(SPACING["xs"], SPACING["xs"]))
+
+        ctk.CTkLabel(
+            self.classic_settings, text="History:",
+            font=ctk.CTkFont(family=ff, size=FONTS["body"][1]),
+            text_color=COLORS["text_secondary"],
+        ).grid(row=3, column=0, padx=(SPACING["lg"], SPACING["md"]), pady=(SPACING["xs"], SPACING["xs"]))
+
+        self.history_on_switch = ctk.CTkSwitch(
+            self.classic_settings, text="Keep history",
+            font=ctk.CTkFont(family=ff, size=FONTS["small"][1]),
+            text_color=COLORS["text_secondary"],
+            command=self._on_history_on_change,
+        )
+        if getattr(state, 'classic_history_on', False):
+            self.history_on_switch.select()
+        self.history_on_switch.grid(row=3, column=1, columnspan=2, sticky="w",
+                                    padx=(0, SPACING["lg"]), pady=(SPACING["xs"], SPACING["xs"]))
 
         # ── Pop-up settings ───────────────────────────────────────────────
         self.popup_settings = ctk.CTkFrame(self.mode_settings_frame, fg_color="transparent")
@@ -368,7 +385,27 @@ class StylePanel(ctk.CTkFrame):
 
         # Horizontal separator
         self.title_sep = ctk.CTkFrame(self.style_container, height=2, fg_color=COLORS["accent_muted"])
-        self.title_sep.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, SPACING["md"]))
+        self.title_sep.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, SPACING["sm"]))
+
+        # Scope toggle (Global vs This Line)
+        scope_row = ctk.CTkFrame(self.style_container, fg_color="transparent")
+        scope_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, SPACING["sm"]))
+        ctk.CTkLabel(
+            scope_row, text="Editing:",
+            font=ctk.CTkFont(family=ff, size=FONTS["body"][1]),
+            text_color=COLORS["text_secondary"],
+        ).pack(side="left", padx=(0, SPACING["sm"]))
+        self.scope_var = ctk.StringVar(value="Global")
+        self.scope_btn = ctk.CTkSegmentedButton(
+            scope_row,
+            values=["Global", "This Line"],
+            variable=self.scope_var,
+            font=ctk.CTkFont(family=ff, size=FONTS["small"][1]),
+            selected_color=COLORS["accent"],
+            selected_hover_color=COLORS["accent_hover"],
+            command=self._on_scope_change,
+        )
+        self.scope_btn.pack(side="left")
 
         # Primary Header (Full Width initially, or shared)
         self.appearance_header = ctk.CTkLabel(
@@ -387,10 +424,10 @@ class StylePanel(ctk.CTkFrame):
         # grid() called in _update_secondary_visibility
 
         self.primary_controls = StyleColumn(self.style_container, state, "primary", "")
-        self.primary_controls.grid(row=3, column=0, sticky="nsew", padx=(0, SPACING["sm"]))
+        self.primary_controls.grid(row=4, column=0, sticky="nsew", padx=(0, SPACING["sm"]))
 
         self.secondary_controls = StyleColumn(self.style_container, state, "secondary", "")
-        self.secondary_controls.grid(row=3, column=1, sticky="nsew", padx=(SPACING["sm"], 0))
+        self.secondary_controls.grid(row=4, column=1, sticky="nsew", padx=(SPACING["sm"], 0))
 
         # --- Bilingual Layout Tools ---
         self.layout_frame = ctk.CTkFrame(self, fg_color=COLORS["bg_secondary"], corner_radius=RADIUS["card"])
@@ -508,9 +545,12 @@ class StylePanel(ctk.CTkFrame):
     def _on_wordbyw_history_change(self, value):
         self.state.set_wordbyw_history_style(value.lower())
 
-    def _on_history_mode_change(self, value):
-        mapping = {"None": "none", "Color": "color", "Box": "box"}
-        self.state.set_classic_history_mode(mapping.get(value, "none"))
+    def _on_active_marker_change(self, value):
+        mapping = {"Color": "color", "Box": "box", "Color+Box": "color_box"}
+        self.state.set_classic_active_marker(mapping.get(value, "color"))
+
+    def _on_history_on_change(self):
+        self.state.set_classic_history_on(self.history_on_switch.get() == 1)
 
     def _on_state_change(self, field):
         if field == "bilingual":
@@ -528,9 +568,14 @@ class StylePanel(ctk.CTkFrame):
                 self.duration_row.grid_remove()
             else:
                 self.duration_row.grid()
-        elif field == "classic_history_mode":
-            mapping = {"none": "None", "color": "Color", "box": "Box"}
-            self.history_mode_var.set(mapping.get(self.state.classic_history_mode, "None"))
+        elif field == "classic_active_marker":
+            mapping = {"color": "Color", "box": "Box", "color_box": "Color+Box"}
+            self.active_marker_var.set(mapping.get(self.state.classic_active_marker, "Color"))
+        elif field == "classic_history_on":
+            if self.state.classic_history_on:
+                self.history_on_switch.select()
+            else:
+                self.history_on_switch.deselect()
         elif field == "karaoke_highlight_color":
             self._draw_highlight_swatch(self.state.karaoke_highlight_color)
             self._highlight_hex_label.configure(text=self.state.karaoke_highlight_color)
@@ -550,6 +595,31 @@ class StylePanel(ctk.CTkFrame):
             self.wordbyw_entry_var.set(self.state.wordbyw_entry_style.capitalize())
         elif field == "wordbyw_history_style":
             self.wordbyw_history_var.set(self.state.wordbyw_history_style.capitalize())
+        elif field == "selected_subtitle":
+            if self.scope_var.get() == "This Line":
+                self._refresh_scope_display()
+        elif field == "style":
+            if self.scope_var.get() == "Global":
+                self.primary_controls.refresh_from_style()
+
+    def _on_scope_change(self, value):
+        if value == "This Line":
+            if self.state.selected_subtitle_index < 0:
+                self.scope_var.set("Global")
+                return
+            self._refresh_scope_display()
+        else:
+            self.primary_controls.set_scope("global", self.state.primary_style)
+
+    def _refresh_scope_display(self):
+        idx = self.state.selected_subtitle_index
+        if idx < 0:
+            self.scope_var.set("Global")
+            self.primary_controls.set_scope("global", self.state.primary_style)
+            return
+        sub = self.state.subtitles[idx]
+        style = sub.style_override if sub.style_override is not None else self.state.primary_style
+        self.primary_controls.set_scope("line", style)
 
     def _draw_highlight_swatch(self, color):
         self._highlight_swatch.delete("all")
@@ -570,8 +640,8 @@ class StylePanel(ctk.CTkFrame):
     def _update_secondary_visibility(self):
         if self.state.bilingual:
             self.appearance_main_title.configure(text="Appearance Shared Preview")
-            self.appearance_header.grid(row=2, column=0, sticky="w", pady=(SPACING["sm"], 0))
-            self.secondary_header.grid(row=2, column=1, sticky="w", padx=(SPACING["sm"], 0), pady=(SPACING["sm"], 0))
+            self.appearance_header.grid(row=3, column=0, sticky="w", pady=(SPACING["sm"], 0))
+            self.secondary_header.grid(row=3, column=1, sticky="w", padx=(SPACING["sm"], 0), pady=(SPACING["sm"], 0))
             self.secondary_controls.grid()
         else:
             self.appearance_main_title.configure(text="Appearance Settings")
@@ -650,6 +720,7 @@ class StyleColumn(ctk.CTkFrame):
         super().__init__(parent, fg_color=COLORS["bg_secondary"], corner_radius=RADIUS["card"], **kwargs)
         self.state = state
         self.style_key = style_key
+        self._scope = "global"  # "global" or "line"
 
         style = self.state.primary_style if style_key == "primary" else self.state.secondary_style
         ff = get_font_family()
@@ -1019,9 +1090,24 @@ class StyleColumn(ctk.CTkFrame):
         )
         self.glow_radius_label.grid(row=0, column=2)
 
-    def refresh_from_style(self):
-        """Sync all UI controls to match current state style."""
-        style = self.state.primary_style if self.style_key == "primary" else self.state.secondary_style
+    def _get_current_style(self):
+        """Return the style object this column should read/write, based on current scope."""
+        if self._scope == "line":
+            idx = self.state.selected_subtitle_index
+            if 0 <= idx < len(self.state.subtitles):
+                sub = self.state.subtitles[idx]
+                return sub.style_override if sub.style_override is not None else self.state.primary_style
+        return self.state.primary_style if self.style_key == "primary" else self.state.secondary_style
+
+    def set_scope(self, scope: str, style=None):
+        """Switch between 'global' and 'line' scope and optionally refresh widgets."""
+        self._scope = scope
+        self.refresh_from_style(style)
+
+    def refresh_from_style(self, style=None):
+        """Sync all UI controls to match the given style (or current scope style if None)."""
+        if style is None:
+            style = self._get_current_style()
         self.font_var.set(style.font_family)
         self.size_slider.set(style.font_size)
         self.size_label.configure(text=str(style.font_size))
@@ -1110,7 +1196,7 @@ class StyleColumn(ctk.CTkFrame):
         self._update_style(glow_radius=v)
 
     def _pick_color(self, attr, swatch_canvas, hex_label):
-        style = self.state.primary_style if self.style_key == "primary" else self.state.secondary_style
+        style = self._get_current_style()
         current = getattr(style, attr)
         result = colorchooser.askcolor(color=current, title=f"Choose {attr.replace('_', ' ').title()}")
         if result[1]:
@@ -1120,7 +1206,19 @@ class StyleColumn(ctk.CTkFrame):
             self._update_style(**{attr: hex_color})
 
     def _update_style(self, **kwargs):
-        if self.style_key == "primary":
+        if self._scope == "line":
+            import copy
+            idx = self.state.selected_subtitle_index
+            if 0 <= idx < len(self.state.subtitles):
+                sub = self.state.subtitles[idx]
+                if sub.style_override is None:
+                    sub.style_override = copy.deepcopy(self.state.primary_style)
+                for k, v in kwargs.items():
+                    if hasattr(sub.style_override, k):
+                        setattr(sub.style_override, k, v)
+                self.state.notify("subtitles_edited")
+                self.state.notify("style")
+        elif self.style_key == "primary":
             self.state.update_primary_style(**kwargs)
         else:
             self.state.update_secondary_style(**kwargs)
