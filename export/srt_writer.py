@@ -11,11 +11,14 @@ def write_srt(entries, output_path: str, bilingual: bool = False):
     for entry in entries:
         lines.append(str(entry.index))
         lines.append(f"{format_srt_time(entry.start)} --> {format_srt_time(entry.end)}")
+
+        text = entry.original_text
+
         if bilingual and entry.translated_text:
-            lines.append(entry.original_text)
+            lines.append(text)
             lines.append(entry.translated_text)
         else:
-            lines.append(entry.original_text)
+            lines.append(text)
         lines.append("")
 
     with open(output_path, "w", encoding="utf-8") as f:

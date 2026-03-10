@@ -1,7 +1,11 @@
 import threading
+import os
 from google import genai
+from dotenv import load_dotenv
 
-GEMINI_API_KEY = "AIzaSyBW6O65IRtTqlhM0Sjtz8IDcX-dzsKF1CU"
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 BATCH_SIZE = 50
 
 LANGUAGES = [
@@ -51,6 +55,7 @@ class Translator:
 
                 prompt = (
                     f"Translate the following numbered subtitle lines to {target_language}. "
+                    f"For technical terms and proper nouns, translate only if a widely accepted translation exists; otherwise keep the original. "
                     f"Return ONLY the translations in the exact same numbered format: number|translated text. "
                     f"Keep the numbering identical. Do not add explanations.\n\n"
                     f"{numbered_lines}"

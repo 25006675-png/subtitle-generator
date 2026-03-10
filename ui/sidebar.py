@@ -15,6 +15,7 @@ class Sidebar(ctk.CTkFrame):
         self.desc_labels = []
         self._animating = False
         self._completed_steps = set()
+        self._labels_visible = True
 
         self.grid_columnconfigure(0, weight=1)
 
@@ -131,9 +132,23 @@ class Sidebar(ctk.CTkFrame):
         spacer.grid(row=3, column=0, sticky="nsew")
         self.grid_rowconfigure(3, weight=1)
 
+        # Settings gear button
+        self.settings_btn = ctk.CTkButton(
+            self, text="⚙  Settings",
+            font=ctk.CTkFont(family=ff, size=FONTS["sidebar_label"][1]),
+            fg_color="transparent",
+            hover_color=COLORS["sidebar_hover"],
+            text_color=COLORS["text_secondary"],
+            anchor="w", height=36,
+            corner_radius=RADIUS["md"],
+            cursor="hand2",
+            command=self._on_settings_click,
+        )
+        self.settings_btn.grid(row=4, column=0, sticky="ew", padx=SPACING["sm"], pady=(0, SPACING["xs"]))
+
         # Theme toggle at bottom
         self.theme_frame = ctk.CTkFrame(self, fg_color="transparent", height=48)
-        self.theme_frame.grid(row=4, column=0, sticky="ew", padx=SPACING["sm"], pady=SPACING["md"])
+        self.theme_frame.grid(row=5, column=0, sticky="ew", padx=SPACING["sm"], pady=SPACING["md"])
         self.theme_frame.grid_columnconfigure(1, weight=1)
 
         # Pillow sun/moon icon
@@ -170,6 +185,9 @@ class Sidebar(ctk.CTkFrame):
 
     def _on_step_click(self, index):
         self.state.set_step(index)
+
+    def _on_settings_click(self):
+        self.state.set_step(4)
 
     def _on_hover(self, index, entering):
         if index == self.state.current_step:
@@ -262,6 +280,11 @@ class Sidebar(ctk.CTkFrame):
     def _on_state_change(self, field):
         if field == "step":
             self._update_all_indicators()
+            is_settings = self.state.current_step == 4
+            self.settings_btn.configure(
+                fg_color=COLORS["sidebar_active"] if is_settings else "transparent",
+                text_color=COLORS["sidebar_icon_active"] if is_settings else COLORS["text_secondary"],
+            )
         elif field in ("video", "subtitles"):
             self._update_all_indicators()
 
@@ -294,24 +317,28 @@ class Sidebar(ctk.CTkFrame):
     def _apply_width(self, width):
         self.configure(width=width)
         show_labels = width > SIDEBAR["collapsed_width"] + 20
-        for lbl in self.step_labels:
+        if show_labels != self._labels_visible:
+            self._labels_visible = show_labels
+            for lbl in self.step_labels:
+                if show_labels:
+                    lbl.grid()
+                else:
+                    lbl.grid_remove()
+            for desc in self.desc_labels:
+                if show_labels:
+                    desc.grid()
+                else:
+                    desc.grid_remove()
             if show_labels:
-                lbl.grid()
+                self.brand_inner.grid()
+                self.theme_switch.grid()
+                self.separator.grid()
+                self.settings_btn.configure(text="⚙  Settings")
             else:
-                lbl.grid_remove()
-        for desc in self.desc_labels:
-            if show_labels:
-                desc.grid()
-            else:
-                desc.grid_remove()
-        if show_labels:
-            self.brand_inner.grid()
-            self.theme_switch.grid()
-            self.separator.grid()
-        else:
-            self.brand_inner.grid_remove()
-            self.theme_switch.grid_remove()
-            self.separator.grid_remove()
+                self.brand_inner.grid_remove()
+                self.theme_switch.grid_remove()
+                self.separator.grid_remove()
+                self.settings_btn.configure(text="⚙")
 
     def _toggle_theme(self):
         mode = "Dark" if self.theme_switch.get() else "Light"

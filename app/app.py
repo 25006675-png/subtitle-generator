@@ -9,6 +9,7 @@ from ui.panels.video_panel import VideoPanel
 from ui.panels.transcribe_panel import TranscribePanel
 from ui.panels.style_panel import StylePanel
 from ui.panels.export_panel import ExportPanel
+from ui.panels.settings_panel import SettingsPanel
 
 
 class SubtitleGeneratorApp(ctk.CTk):
@@ -101,7 +102,9 @@ class SubtitleGeneratorApp(ctk.CTk):
             TranscribePanel(self.control_scroll, self.app_state),
             StylePanel(self.control_scroll, self.app_state),
             ExportPanel(self.control_scroll, self.app_state),
+            SettingsPanel(self.control_scroll, self.app_state),
         ]
+        self._active_panel_index = None
 
         # Fix black edge artifacts from CTkFrame inside PanedWindow
         for w in (self.video_preview, self.subtitle_list, self.control_container):
@@ -121,13 +124,21 @@ class SubtitleGeneratorApp(ctk.CTk):
             self._update_pane_colors()
 
     def _show_panel(self, index):
-        for panel in self.panels:
-            panel.grid_remove()
-        if 0 <= index < len(self.panels):
-            self.panels[index].grid(row=0, column=0, sticky="nsew")
-            parent_canvas = getattr(self.control_scroll, "_parent_canvas", None)
-            if parent_canvas is not None:
-                parent_canvas.yview_moveto(0)
+        if not (0 <= index < len(self.panels)):
+            return
+
+        if self._active_panel_index == index:
+            return
+
+        if self._active_panel_index is not None and 0 <= self._active_panel_index < len(self.panels):
+            self.panels[self._active_panel_index].grid_remove()
+
+        self.panels[index].grid(row=0, column=0, sticky="nsew")
+        self._active_panel_index = index
+
+        parent_canvas = getattr(self.control_scroll, "_parent_canvas", None)
+        if parent_canvas is not None:
+            self.after_idle(lambda: parent_canvas.yview_moveto(0))
 
     def _resolve_pane_color(self) -> str:
         is_dark = ctk.get_appearance_mode().lower() == "dark"
