@@ -1,1 +1,8 @@
 .env
+*.dll
+__pycache__/
+*.pyc
+assets/*.json
+!assets/presets.json
+!assets/user_presets.json
+
