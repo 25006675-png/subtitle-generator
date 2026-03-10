@@ -6,19 +6,13 @@ def format_srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def write_srt(entries, output_path: str, bilingual: bool = False,
-              include_speaker_labels: bool = False, speakers: dict = None):
+def write_srt(entries, output_path: str, bilingual: bool = False):
     lines = []
     for entry in entries:
         lines.append(str(entry.index))
         lines.append(f"{format_srt_time(entry.start)} --> {format_srt_time(entry.end)}")
 
         text = entry.original_text
-        if include_speaker_labels and entry.speaker_id:
-            spk_name = entry.speaker_id
-            if speakers and entry.speaker_id in speakers:
-                spk_name = speakers[entry.speaker_id].display_name or entry.speaker_id
-            text = f"[{spk_name}] {text}"
 
         if bilingual and entry.translated_text:
             lines.append(text)

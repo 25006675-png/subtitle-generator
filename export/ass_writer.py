@@ -1,4 +1,5 @@
 from core.subtitle_model import SubtitleStyle
+from core.font_catalog import resolve_font_family_name
 
 
 def hex_to_ass_color(hex_color: str, opacity: float = 1.0) -> str:
@@ -25,7 +26,7 @@ def format_ass_time(seconds: float) -> str:
 
 
 def build_style_line(name: str, style: SubtitleStyle) -> str:
-    font = style.font_family
+    font = resolve_font_family_name(style.font_family) or style.font_family
     size = style.font_size
     primary = hex_to_ass_color(style.primary_color)
     outline = hex_to_ass_color(style.outline_color)
@@ -33,6 +34,8 @@ def build_style_line(name: str, style: SubtitleStyle) -> str:
     italic = -1 if style.italic else 0
     border = style.outline_thickness
     alignment = position_to_alignment(style.position)
+    width_pct = max(1, min(100, int(getattr(style, "text_width_percent", 90))))
+    side_margin = int((1920 * (100 - width_pct) / 100) / 2)
 
     # Shadow: use the larger of offset_x/offset_y as ASS shadow depth
     if getattr(style, 'shadow_enabled', False):
@@ -49,7 +52,7 @@ def build_style_line(name: str, style: SubtitleStyle) -> str:
 
     return (
         f"Style: {name},{font},{size},{primary},&H000000FF,{outline},{back_color},"
-        f"{bold},{italic},0,0,100,100,0,0,{border_style},{border},{shadow_depth},{alignment},10,10,10,1"
+        f"{bold},{italic},0,0,100,100,0,0,{border_style},{border},{shadow_depth},{alignment},{side_margin},{side_margin},10,1"
     )
 
 
@@ -72,9 +75,9 @@ def _entry_anim_tag(animation_style: str, position: str, duration_ms: int = 300)
 
 def write_ass(entries, output_path: str, primary_style: SubtitleStyle,
               secondary_style: SubtitleStyle | None = None, bilingual: bool = False,
-              karaoke_mode: str = "off", speakers: dict = None,
-              include_speaker_labels: bool = False, animation_style: str = "none",
-              transition_duration: float = 0.30):
+              karaoke_mode: str = "off", animation_style: str = "none",
+              transition_duration: float = 0.30,
+              translation_animation_style: str = "none"):
     lines = [
         "[Script Info]",
         "Title: Generated Subtitles",
@@ -93,53 +96,51 @@ def write_ass(entries, output_path: str, primary_style: SubtitleStyle,
     if bilingual and secondary_style:
         lines.append(build_style_line("Secondary", secondary_style))
 
-    # Per-speaker styles (Feature 4)
-    speaker_style_names = {}
-    if speakers:
-        for spk_id, spk_info in speakers.items():
-            if spk_info.style:
-                style_name = f"Speaker_{spk_id.replace(' ', '_')}"
-                lines.append(build_style_line(style_name, spk_info.style))
-                speaker_style_names[spk_id] = style_name
-
     lines += [
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
 
-    duration_ms = int(transition_duration * 1000)
-    anim_tag = _entry_anim_tag(animation_style, primary_style.position, duration_ms)
+    default_anim = {
+        "karaoke_mode": karaoke_mode,
+        "animation_style": animation_style,
+        "transition_duration": transition_duration,
+        "translation_animation_style": translation_animation_style,
+    }
 
     def _pos_tag(style: SubtitleStyle) -> str:
-        """Build \\pos tag from position_offset if non-zero, else empty string."""
-        offset = getattr(style, 'position_offset', 0)
-        if not offset:
-            return ""
-        # Map position to base Y at 1080p then apply offset
-        base_y = {"bottom": 1010, "center": 540, "top": 70}.get(style.position, 1010)
-        adjusted_y = base_y + int(1080 * offset / 100)
+        """Build \pos tag from absolute vertical percent (0-100), with legacy fallback."""
+        if hasattr(style, "position_y_percent"):
+            try:
+                pos_pct = max(0, min(100, int(getattr(style, "position_y_percent"))))
+            except Exception:
+                pos_pct = 100
+        else:
+            base = {"top": 10, "center": 50, "bottom": 87}.get(getattr(style, "position", "bottom"), 87)
+            pos_pct = max(0, min(100, base + int(getattr(style, "position_offset", 0))))
+        adjusted_y = int(1080 * pos_pct / 100)
         return rf"\pos(960,{adjusted_y})"
 
     for entry in entries:
         start = format_ass_time(entry.start)
         end = format_ass_time(entry.end)
+        anim = dict(default_anim)
+        if getattr(entry, "animation_override", None) is not None:
+            anim.update(entry.animation_override.to_dict())
 
-        # Determine style name
         style_name = "Primary"
-        if entry.speaker_id and entry.speaker_id in speaker_style_names:
-            style_name = speaker_style_names[entry.speaker_id]
-
-        # Build text with optional speaker label
         text = entry.original_text.replace("\n", "\\N")
-        if include_speaker_labels and entry.speaker_id:
-            spk_name = entry.speaker_id
-            if speakers and entry.speaker_id in speakers:
-                spk_name = speakers[entry.speaker_id].display_name or entry.speaker_id
-            text = f"[{spk_name}] {text}"
+        entry_duration_ms = int(float(anim.get("transition_duration", transition_duration)) * 1000)
+        anim_tag = _entry_anim_tag(anim.get("animation_style", animation_style), primary_style.position, entry_duration_ms)
+        trans_anim_tag = _entry_anim_tag(
+            anim.get("translation_animation_style", translation_animation_style),
+            secondary_style.position if secondary_style else "bottom",
+            entry_duration_ms,
+        )
 
         # Typewriter: emit one sequential line per word
-        if animation_style == "typewriter" and karaoke_mode == "off":
+        if anim.get("animation_style", animation_style) == "typewriter" and anim.get("karaoke_mode", karaoke_mode) == "off":
             words = entry.original_text.split()
             if len(words) > 1:
                 dur = entry.end - entry.start
@@ -151,21 +152,20 @@ def write_ass(entries, output_path: str, primary_style: SubtitleStyle,
                     lines.append(f"Dialogue: 0,{t0},{t1},{style_name},,0,0,0,,{partial}")
                 if bilingual and entry.translated_text and secondary_style:
                     trans = entry.translated_text.replace("\n", "\\N")
-                    lines.append(f"Dialogue: 0,{start},{end},Secondary,,0,0,0,,{trans}")
+                    sec_pos = _pos_tag(secondary_style)
+                    tagged_sec = f"{{{sec_pos}}}{trans}" if sec_pos else trans
+                    lines.append(f"Dialogue: 0,{start},{end},Secondary,,0,0,0,,{tagged_sec}")
                 continue
 
         # Determine effective style for position_offset
         eff_style = primary_style
-        if entry.speaker_id and entry.speaker_id in speaker_style_names:
-            if speakers and entry.speaker_id in speakers and speakers[entry.speaker_id].style:
-                eff_style = speakers[entry.speaker_id].style
         if getattr(entry, 'style_override', None) is not None:
             eff_style = entry.style_override
 
         pos = _pos_tag(eff_style)
 
         # Karaoke mode (Feature 3)
-        if karaoke_mode != "off" and hasattr(entry, 'words') and entry.words:
+        if anim.get("karaoke_mode", karaoke_mode) != "off" and hasattr(entry, 'words') and entry.words:
             karaoke_text = _build_karaoke_text(entry)
             prefix = f"{{{pos}}}" if pos else ""
             lines.append(f"Dialogue: 0,{start},{end},{style_name},,0,0,0,,{prefix}{karaoke_text}")
@@ -176,7 +176,10 @@ def write_ass(entries, output_path: str, primary_style: SubtitleStyle,
 
         if bilingual and entry.translated_text and secondary_style:
             trans = entry.translated_text.replace("\n", "\\N")
-            lines.append(f"Dialogue: 0,{start},{end},Secondary,,0,0,0,,{trans}")
+            sec_pos = _pos_tag(secondary_style)
+            sec_tags = trans_anim_tag + sec_pos
+            tagged_trans = f"{{{sec_tags}}}{trans}" if sec_tags else trans
+            lines.append(f"Dialogue: 0,{start},{end},Secondary,,0,0,0,,{tagged_trans}")
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))

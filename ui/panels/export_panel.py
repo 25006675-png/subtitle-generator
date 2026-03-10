@@ -4,7 +4,7 @@ from tkinter import filedialog
 from app.theme import COLORS, FONTS, SPACING, RADIUS, IconRenderer, get_font_family
 from export.srt_writer import write_srt
 from export.ass_writer import write_ass
-from export.ffmpeg_burner import check_ffmpeg, burn_subtitles, QUALITY_PRESETS
+from export.ffmpeg_burner import check_ffmpeg, burn_subtitles, QUALITY_PRESETS, ENCODER_PRESETS
 
 
 class ExportPanel(ctk.CTkFrame):
@@ -57,6 +57,20 @@ class ExportPanel(ctk.CTkFrame):
             checkmark_color=COLORS["button_text"],
         ).grid(row=0, column=1)
 
+        self.ass_note_label = ctk.CTkLabel(
+            sub_section,
+            text="⚠  ASS animations are approximated — the exported file may not match the preview exactly due to ASS format limitations.",
+            font=ctk.CTkFont(family=ff, size=FONTS["small"][1]),
+            text_color=COLORS["text_muted"],
+            anchor="w", wraplength=760, justify="left",
+        )
+        self.ass_note_label.grid(row=2, column=0, sticky="ew", padx=SPACING["lg"], pady=(0, SPACING["xs"]))
+        sub_section.bind(
+            "<Configure>",
+            lambda event, label=self.ass_note_label: label.configure(wraplength=max(260, event.width - (SPACING["lg"] * 2))),
+            add="+",
+        )
+
         # Bilingual option
         self.bilingual_export_var = ctk.BooleanVar(value=True)
         self.bilingual_check = ctk.CTkCheckBox(
@@ -66,18 +80,7 @@ class ExportPanel(ctk.CTkFrame):
             fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
             checkmark_color=COLORS["button_text"],
         )
-        self.bilingual_check.grid(row=2, column=0, sticky="w", padx=SPACING["lg"], pady=(0, SPACING["sm"]))
-
-        # Speaker labels option (Feature 4)
-        self.speaker_labels_var = ctk.BooleanVar(value=False)
-        self.speaker_labels_check = ctk.CTkCheckBox(
-            sub_section, text="Include speaker labels", variable=self.speaker_labels_var,
-            font=ctk.CTkFont(family=ff, size=FONTS["small"][1]),
-            text_color=COLORS["text_secondary"],
-            fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
-            checkmark_color=COLORS["button_text"],
-        )
-        self.speaker_labels_check.grid(row=3, column=0, sticky="w", padx=SPACING["lg"], pady=(0, SPACING["sm"]))
+        self.bilingual_check.grid(row=3, column=0, sticky="w", padx=SPACING["lg"], pady=(0, SPACING["sm"]))
 
         # Export button with download icon
         btn_frame = ctk.CTkFrame(sub_section, fg_color="transparent")
@@ -119,6 +122,19 @@ class ExportPanel(ctk.CTkFrame):
             text_color=COLORS["text_heading"], anchor="w",
         ).grid(row=0, column=0, sticky="w", padx=SPACING["lg"], pady=(SPACING["md"], SPACING["sm"]))
 
+        self.burn_note_label = ctk.CTkLabel(
+            burn_section,
+            text="Burn-in uses the same Pillow subtitle renderer as preview, so the exported video should look very similar. Expect small differences mainly in glow softness, while ASS subtitle files can still differ more.",
+            font=ctk.CTkFont(family=ff, size=FONTS["small"][1]),
+            text_color=COLORS["text_muted"], anchor="w", wraplength=760, justify="left",
+        )
+        self.burn_note_label.grid(row=1, column=0, sticky="ew", padx=SPACING["lg"], pady=(0, SPACING["xs"]))
+        burn_section.bind(
+            "<Configure>",
+            lambda event, label=self.burn_note_label: label.configure(wraplength=max(260, event.width - (SPACING["lg"] * 2))),
+            add="+",
+        )
+
         # FFmpeg status badge (pill-shaped)
         ffmpeg_ok = check_ffmpeg()
         badge_text = "FFmpeg Found" if ffmpeg_ok else "FFmpeg Not Found"
@@ -133,20 +149,20 @@ class ExportPanel(ctk.CTkFrame):
             corner_radius=RADIUS["pill"],
             height=22,
         )
-        self.ffmpeg_badge.grid(row=1, column=0, sticky="w", padx=SPACING["lg"], pady=(0, SPACING["sm"]))
+        self.ffmpeg_badge.grid(row=2, column=0, sticky="w", padx=SPACING["lg"], pady=(0, SPACING["sm"]))
 
         # Quality preset
         q_frame = ctk.CTkFrame(burn_section, fg_color="transparent")
-        q_frame.grid(row=2, column=0, sticky="ew", padx=SPACING["lg"])
+        q_frame.grid(row=3, column=0, sticky="ew", padx=SPACING["lg"])
         q_frame.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(
-            q_frame, text="Quality:",
+            q_frame, text="Burn Quality:",
             font=ctk.CTkFont(family=ff, size=FONTS["body"][1]),
             text_color=COLORS["text_secondary"],
         ).grid(row=0, column=0, padx=(0, SPACING["md"]))
 
-        self.quality_var = ctk.StringVar(value="Medium (balanced)")
+        self.quality_var = ctk.StringVar(value="Balanced")
         self.quality_dropdown = ctk.CTkComboBox(
             q_frame, values=list(QUALITY_PRESETS.keys()),
             variable=self.quality_var,
@@ -159,9 +175,32 @@ class ExportPanel(ctk.CTkFrame):
         )
         self.quality_dropdown.grid(row=0, column=1, sticky="ew")
 
+        accel_frame = ctk.CTkFrame(burn_section, fg_color="transparent")
+        accel_frame.grid(row=4, column=0, sticky="ew", padx=SPACING["lg"], pady=(SPACING["sm"], 0))
+        accel_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            accel_frame, text="Hardware Acceleration:",
+            font=ctk.CTkFont(family=ff, size=FONTS["body"][1]),
+            text_color=COLORS["text_secondary"],
+        ).grid(row=0, column=0, padx=(0, SPACING["md"]))
+
+        self.encoder_var = ctk.StringVar(value="None (CPU)")
+        self.encoder_dropdown = ctk.CTkComboBox(
+            accel_frame, values=list(ENCODER_PRESETS.keys()),
+            variable=self.encoder_var,
+            font=ctk.CTkFont(family=ff, size=FONTS["small"][1]),
+            fg_color=COLORS["entry_bg"], border_color=COLORS["entry_border"],
+            button_color=COLORS["accent"], button_hover_color=COLORS["accent_hover"],
+            dropdown_fg_color=COLORS["bg_secondary"],
+            corner_radius=RADIUS["sm"], height=30,
+            state="readonly",
+        )
+        self.encoder_dropdown.grid(row=0, column=1, sticky="ew")
+
         # Burn button + progress
         burn_action = ctk.CTkFrame(burn_section, fg_color="transparent")
-        burn_action.grid(row=3, column=0, sticky="ew", padx=SPACING["lg"], pady=SPACING["md"])
+        burn_action.grid(row=5, column=0, sticky="ew", padx=SPACING["lg"], pady=SPACING["md"])
         burn_action.grid_columnconfigure(1, weight=1)
 
         self.burn_btn = ctk.CTkButton(
@@ -203,7 +242,7 @@ class ExportPanel(ctk.CTkFrame):
             font=ctk.CTkFont(family=ff, size=FONTS["small"][1]),
             text_color=COLORS["text_muted"], anchor="w",
         )
-        self.burn_status.grid(row=4, column=0, sticky="w", padx=SPACING["lg"], pady=(0, SPACING["md"]))
+        self.burn_status.grid(row=6, column=0, sticky="w", padx=SPACING["lg"], pady=(0, SPACING["md"]))
 
     def _export_subtitles(self):
         if not self.state.subtitles:
@@ -216,15 +255,12 @@ class ExportPanel(ctk.CTkFrame):
 
         base_name = os.path.splitext(self.state.video_info.get("filename", "subtitles"))[0]
         bilingual = self.state.bilingual and self.bilingual_export_var.get()
-        include_speakers = self.speaker_labels_var.get()
-        speakers = getattr(self.state, 'speakers', {})
         karaoke_mode = getattr(self.state, 'karaoke_mode', 'off')
         exported = []
 
         if self.srt_var.get():
             srt_path = os.path.join(out_dir, f"{base_name}.srt")
-            write_srt(self.state.subtitles, srt_path, bilingual=bilingual,
-                      include_speaker_labels=include_speakers, speakers=speakers)
+            write_srt(self.state.subtitles, srt_path, bilingual=bilingual)
             exported.append("SRT")
 
         if self.ass_var.get():
@@ -235,10 +271,9 @@ class ExportPanel(ctk.CTkFrame):
                 secondary_style=self.state.secondary_style if bilingual else None,
                 bilingual=bilingual,
                 karaoke_mode=karaoke_mode,
-                speakers=speakers if include_speakers else None,
-                include_speaker_labels=include_speakers,
                 animation_style=getattr(self.state, 'animation_style', 'none'),
                 transition_duration=getattr(self.state, 'transition_duration', 0.30),
+                translation_animation_style=getattr(self.state, 'translation_animation_style', 'none'),
             )
             exported.append("ASS")
 
@@ -257,25 +292,6 @@ class ExportPanel(ctk.CTkFrame):
         if self.state.is_burning:
             return
 
-        import tempfile
-        tmp_ass = os.path.join(tempfile.gettempdir(), "subtitle_burn_temp.ass")
-        bilingual = self.state.bilingual and self.bilingual_export_var.get()
-        include_speakers = self.speaker_labels_var.get()
-        speakers = getattr(self.state, 'speakers', {})
-        karaoke_mode = getattr(self.state, 'karaoke_mode', 'off')
-
-        write_ass(
-            self.state.subtitles, tmp_ass,
-            primary_style=self.state.primary_style,
-            secondary_style=self.state.secondary_style if bilingual else None,
-            bilingual=bilingual,
-            karaoke_mode=karaoke_mode,
-            speakers=speakers if include_speakers else None,
-            include_speaker_labels=include_speakers,
-            animation_style=getattr(self.state, 'animation_style', 'none'),
-            transition_duration=getattr(self.state, 'transition_duration', 0.30),
-        )
-
         base = os.path.splitext(self.state.video_path)[0]
         output_path = filedialog.asksaveasfilename(
             title="Save Video With Subtitles",
@@ -290,10 +306,10 @@ class ExportPanel(ctk.CTkFrame):
         self.burn_btn.configure(state="disabled", text="Burning...")
         self.burn_progress.set(0)
         self.burn_pct_label.configure(text="0%")
-        self.burn_status.configure(text="Starting FFmpeg...", text_color=COLORS["text_muted"])
+        self.burn_status.configure(text="Rendering subtitle overlays...", text_color=COLORS["text_muted"])
 
-        def on_progress(p):
-            self.after(0, lambda: self._update_burn_progress(p))
+        def on_progress(p, status=None):
+            self.after(0, lambda: self._update_burn_progress(p, status))
 
         def on_complete(path):
             self.after(0, lambda: self._on_burn_done(path))
@@ -302,18 +318,20 @@ class ExportPanel(ctk.CTkFrame):
             self.after(0, lambda: self._on_burn_error(msg))
 
         burn_subtitles(
-            self.state.video_path, tmp_ass, output_path,
+            self.state, output_path,
             quality_preset=self.quality_var.get(),
+            video_encoder=self.encoder_var.get(),
+            include_translations=self.bilingual_export_var.get(),
             on_progress=on_progress,
             on_complete=on_complete,
             on_error=on_error,
         )
 
-    def _update_burn_progress(self, p):
+    def _update_burn_progress(self, p, status=None):
         self.burn_progress.set(p)
         pct = int(p * 100)
         self.burn_pct_label.configure(text=f"{pct}%")
-        self.burn_status.configure(text=f"Burning... {pct}%")
+        self.burn_status.configure(text=status or f"Burning... {pct}%", text_color=COLORS["text_muted"])
 
     def _on_burn_done(self, path):
         self.state.is_burning = False

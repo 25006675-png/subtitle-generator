@@ -10,10 +10,41 @@ class WordEntry:
 
 
 @dataclass
-class SpeakerInfo:
-    id: str
-    display_name: str = ""
-    style: "SubtitleStyle | None" = None
+class SubtitleAnimation:
+    karaoke_mode: str = "off"
+    animation_style: str = "none"
+    translation_animation_style: str = "none"
+    transition_duration: float = 0.30
+    karaoke_highlight_color: str = "#FFFF00"
+    classic_dimmed_opacity: float = 0.5
+    popup_trail_count: int = 3
+    popup_min_chars: int = 3
+    wordbyw_entry_style: str = "instant"
+    wordbyw_history_dim: float = 1.0
+    classic_active_marker: str = "color"
+    classic_history_on: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "karaoke_mode": self.karaoke_mode,
+            "animation_style": self.animation_style,
+            "translation_animation_style": self.translation_animation_style,
+            "transition_duration": self.transition_duration,
+            "karaoke_highlight_color": self.karaoke_highlight_color,
+            "classic_dimmed_opacity": self.classic_dimmed_opacity,
+            "popup_trail_count": self.popup_trail_count,
+            "popup_min_chars": self.popup_min_chars,
+            "wordbyw_entry_style": self.wordbyw_entry_style,
+            "wordbyw_history_dim": self.wordbyw_history_dim,
+            "classic_active_marker": self.classic_active_marker,
+            "classic_history_on": self.classic_history_on,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SubtitleAnimation":
+        valid_fields = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered)
 
 
 @dataclass
@@ -24,8 +55,10 @@ class SubtitleEntry:
     original_text: str = ""
     translated_text: str = ""
     words: list[WordEntry] = field(default_factory=list)
-    speaker_id: str = ""
     style_override: "SubtitleStyle | None" = None
+    primary_style_override: "SubtitleStyle | None" = None
+    secondary_style_override: "SubtitleStyle | None" = None
+    animation_override: SubtitleAnimation | None = None
 
     def duration(self) -> float:
         return self.end - self.start
@@ -45,6 +78,7 @@ class SubtitleStyle:
     background_opacity: float = 0.5
     position: str = "bottom"  # "top", "center", "bottom"
     position_offset: int = 0   # vertical offset % of image height, -50..+50
+    position_y_percent: int = 85  # absolute vertical position 0..100 (bottom baseline)
     shadow_enabled: bool = False
     shadow_color: str = "#000000"
     shadow_blur: int = 0        # 0 = hard shadow; >0 = Gaussian blur radius
@@ -53,6 +87,7 @@ class SubtitleStyle:
     glow_enabled: bool = False
     glow_color: str = "#FFFFFF"
     glow_radius: int = 5        # Gaussian blur radius for glow
+    text_width_percent: int = 90  # 0..100 usable width for subtitle wrapping
 
     def to_dict(self) -> dict:
         return {
@@ -68,6 +103,7 @@ class SubtitleStyle:
             "background_opacity": self.background_opacity,
             "position": self.position,
             "position_offset": self.position_offset,
+            "position_y_percent": self.position_y_percent,
             "shadow_enabled": self.shadow_enabled,
             "shadow_color": self.shadow_color,
             "shadow_blur": self.shadow_blur,
@@ -76,6 +112,7 @@ class SubtitleStyle:
             "glow_enabled": self.glow_enabled,
             "glow_color": self.glow_color,
             "glow_radius": self.glow_radius,
+            "text_width_percent": self.text_width_percent,
         }
 
     @classmethod

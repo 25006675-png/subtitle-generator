@@ -1,16 +1,22 @@
 import customtkinter as ctk
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import colorchooser
 from app.theme import COLORS, FONTS, SPACING, RADIUS, get_font_family
 from core.subtitle_model import remap_word_timestamps, SubtitleStyle
 
 
 class SubtitleList(ctk.CTkFrame):
+    INDEX_W = 30
+    TIME_W = 100
+    DOT_W = 20
+
     def __init__(self, parent, state, **kwargs):
         super().__init__(parent, fg_color=COLORS["bg_secondary"], corner_radius=0, **kwargs)
         self.state = state
         self.rows = []
         self._active_editor = None
+        self._font_lookup = self._build_font_lookup()
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
@@ -38,11 +44,8 @@ class SubtitleList(ctk.CTkFrame):
 
         # Column headers with background bar
         self.col_header = ctk.CTkFrame(self, fg_color=COLORS["bg_tertiary"], height=28,
-                                   corner_radius=RADIUS["xs"])
-        self.col_header.grid(row=1, column=0, sticky="ew", padx=SPACING["md"])
-        self.col_header.grid_columnconfigure(2, weight=1)
-        self.col_header.grid_columnconfigure(3, weight=1)
-
+                                   corner_radius=0)
+        self.col_header.grid(row=1, column=0, sticky="ew", padx=SPACING["sm"])
         self._build_column_headers()
 
         # Scrollable list
@@ -55,36 +58,188 @@ class SubtitleList(ctk.CTkFrame):
         self.scroll_frame.grid(row=2, column=0, sticky="nsew", padx=SPACING["sm"], pady=(SPACING["xs"], SPACING["sm"]))
         self.scroll_frame.grid_columnconfigure(0, weight=1)
 
+        # Sync header width to scroll content area (accounts for scrollbar + internal padding).
+        # Bind to inner frame Configure so it re-syncs on every resize.
+        self.scroll_frame._parent_frame.bind("<Configure>", self._sync_header_width, add="+")
+        self.after(150, self._sync_header_width)
+
+        # Hover hint — placed as overlay so it never shifts layout
+        self.hint_label = ctk.CTkLabel(
+            self, text="✎  Double-click a cell to edit",
+            font=ctk.CTkFont(family=ff, size=FONTS["small"][1], weight="bold"),
+            text_color=COLORS["accent"],
+            fg_color=COLORS["bg_tertiary"],
+            corner_radius=RADIUS["xs"],
+            anchor="w",
+        )
+        # Not placed yet; shown via place(), hidden via place_forget()
+
         # Listen to state
         self.state.add_listener(self._on_state_change)
+
+    @staticmethod
+    def _build_font_lookup() -> dict[str, str]:
+        try:
+            return {name.lower(): name for name in tkfont.families()}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _contains_cjk(text: str) -> bool:
+        if not text:
+            return False
+        return any(
+            ("\u4e00" <= ch <= "\u9fff")
+            or ("\u3400" <= ch <= "\u4dbf")
+            or ("\u3040" <= ch <= "\u30ff")
+            or ("\uac00" <= ch <= "\ud7af")
+            for ch in text
+        )
+
+    @staticmethod
+    def _is_likely_cjk_family(family: str) -> bool:
+        name = (family or "").lower()
+        cjk_tokens = (
+            "yahei", "simhei", "simsun", "msyh", "noto sans cjk", "source han",
+            "gothic", "meiryo", "malgun", "pingfang", "heiti", "song", "kai",
+        )
+        return any(tok in name for tok in cjk_tokens)
+
+    def _pick_text_family(self, text: str, preferred: str | None = None) -> str:
+        preferred = preferred or get_font_family()
+        if not text:
+            return preferred
+
+        # For CJK and other non-Latin scripts, pick broader-coverage UI fonts.
+        if self._contains_cjk(text):
+            cjk_fallbacks = [
+                "Microsoft YaHei UI",
+                "Microsoft YaHei",
+                "SimHei",
+                "SimSun",
+                "Yu Gothic UI",
+                "Meiryo UI",
+                "Segoe UI",
+            ]
+            if self._is_likely_cjk_family(preferred):
+                candidates = [preferred] + cjk_fallbacks
+            else:
+                candidates = cjk_fallbacks + [preferred]
+        elif any(ord(ch) > 0x024F for ch in text):
+            candidates = [
+                "Segoe UI",
+                "Nirmala UI",
+                "Leelawadee UI",
+                "Arial Unicode MS",
+            ]
+        else:
+            return preferred
+
+        for name in candidates:
+            if name.lower() in self._font_lookup:
+                return self._font_lookup[name.lower()]
+        return preferred
+
+    def _set_clipped_label_text(self, label: tk.Label, text: str):
+        full_text = (text or "").strip() or "…"
+        setattr(label, "_full_text", full_text)
+        self._apply_label_clipping(label)
+
+    def _apply_label_clipping(self, label: tk.Label):
+        full_text = getattr(label, "_full_text", "")
+        if not getattr(label, "_clip_enabled", False):
+            label.configure(text=full_text)
+            return
+
+        try:
+            width_px = int(label.winfo_width()) - 2
+            if width_px <= 8:
+                label.configure(text=full_text)
+                return
+
+            font_obj = tkfont.Font(font=label.cget("font"))
+            if font_obj.measure(full_text) <= width_px:
+                label.configure(text=full_text)
+                return
+
+            ellipsis = "…"
+            ellipsis_w = font_obj.measure(ellipsis)
+            if ellipsis_w >= width_px:
+                label.configure(text=ellipsis)
+                return
+
+            lo, hi = 0, len(full_text)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                candidate = full_text[:mid] + ellipsis
+                if font_obj.measure(candidate) <= width_px:
+                    lo = mid
+                else:
+                    hi = mid - 1
+
+            label.configure(text=full_text[:lo] + ellipsis)
+        except Exception:
+            label.configure(text=full_text)
 
     def _build_column_headers(self):
         ff = get_font_family()
         for w in self.col_header.winfo_children():
             w.destroy()
 
-        has_speakers = bool(getattr(self.state, 'speakers', {}))
-        has_translation = self.state.bilingual and any(s.translated_text for s in self.state.subtitles)
-        
-        columns = [("#", 30), ("TIME", 90)]
-        if has_speakers:
-            columns.append(("SPEAKER", 70))
-        
-        columns.append(("ORIGINAL", 100))
-        if has_translation:
-            columns.append(("TRANSLATION", 100))
+        # Reset geometry each rebuild so header and rows stay in lock-step.
+        for col in range(8):
+            self.col_header.grid_columnconfigure(col, weight=0, minsize=0)
 
-        for col, (text, w) in enumerate(columns):
+        has_translation = self.state.bilingual and any(s.translated_text for s in self.state.subtitles)
+
+        # (label_text, minsize, weight, left_padx, right_padx)
+        # Empty text = no label widget (spacer / dot columns must not add padx noise).
+        columns = [
+            ("",            2,               0, 0, 0),
+            ("#",           self.INDEX_W,    0, 2, 2),
+            ("TIME",        self.TIME_W,     0, 2, 2),
+        ]
+        columns.append(("ORIGINAL", 0, 1, 2, 8))
+        if has_translation:
+            columns.append(("TRANSLATION", 0, 1, 2, 2))
+
+        columns.append(("", self.DOT_W, 0, 0, 0))
+
+        for col, (text, min_w, weight, lpad, rpad) in enumerate(columns):
+            self.col_header.grid_columnconfigure(col, weight=weight, minsize=min_w)
+            if not text:
+                continue
             ctk.CTkLabel(
                 self.col_header, text=text,
                 font=ctk.CTkFont(family=ff, size=FONTS["caption"][1], weight="bold"),
                 text_color=COLORS["text_muted"],
-                width=w,
                 anchor="w",
-            ).grid(row=0, column=col, sticky="w", padx=(SPACING["sm"] if col == 0 else 0, SPACING["sm"]))
+            ).grid(row=0, column=col, sticky="w", padx=(lpad, rpad))
+
+    def _sync_header_width(self, event=None):
+        """Align col_header's padx to exactly match the rows' rendered width."""
+        try:
+            self.update_idletasks()
+            # Use the first row as ground truth — it IS what we need to align with.
+            # Fall back to _parent_frame only when no rows exist yet.
+            if self.rows:
+                ref = self.rows[0][0]
+                ref.update_idletasks()
+            else:
+                ref = self.scroll_frame._parent_frame
+            if ref.winfo_width() <= 1:
+                return
+            left_pad  = ref.winfo_rootx() - self.winfo_rootx()
+            right_pad = (self.winfo_rootx() + self.winfo_width()) - (ref.winfo_rootx() + ref.winfo_width())
+            if left_pad < 0 or right_pad < 0:
+                return
+            self.col_header.grid_configure(padx=(left_pad, right_pad))
+            self.after(50, self._sync_header_columns)
+        except Exception:
+            pass
 
     def _on_state_change(self, field):
-        if field in ("subtitles", "speakers"):
+        if field == "subtitles":
             self._build_column_headers()
             self._rebuild_list()
         elif field == "selected_subtitle":
@@ -104,8 +259,6 @@ class SubtitleList(ctk.CTkFrame):
         subs = self.state.subtitles
         self.count_label.configure(text=f"{len(subs)} lines")
 
-        has_speakers = bool(getattr(self.state, 'speakers', {}))
-        speakers = getattr(self.state, 'speakers', {})
         has_translation = self.state.bilingual and any(s.translated_text for s in subs)
 
         for i, sub in enumerate(subs):
@@ -124,25 +277,26 @@ class SubtitleList(ctk.CTkFrame):
             row.grid_propagate(False) # Force the height to exactly 24px
 
             col_idx = 0
-            # Configure column weights based on presence of speakers and translation
-            if has_speakers:
-                row.grid_columnconfigure(1, minsize=30)
-                row.grid_columnconfigure(2, minsize=110)
-                row.grid_columnconfigure(3, minsize=60)
-                if has_translation:
-                    row.grid_columnconfigure(4, weight=1)
-                    row.grid_columnconfigure(5, weight=1)
-                else:
-                    row.grid_columnconfigure(4, weight=2)
-            else:
-                row.grid_columnconfigure(1, minsize=30)
-                row.grid_columnconfigure(2, minsize=110)
-                if has_translation:
-                    row.grid_columnconfigure(3, weight=1)
-                    row.grid_columnconfigure(4, weight=1)
-                else:
-                    row.grid_columnconfigure(3, weight=2)
+            # Configure row columns to match header exactly.
+            for col in range(8):
+                row.grid_columnconfigure(col, weight=0, minsize=0)
             row.grid_columnconfigure(0, minsize=2)
+
+            cfg_col = 1
+            row.grid_columnconfigure(cfg_col, minsize=self.INDEX_W)
+            cfg_col += 1
+            row.grid_columnconfigure(cfg_col, minsize=self.TIME_W)
+            cfg_col += 1
+            if has_translation:
+                row.grid_columnconfigure(cfg_col, weight=1)
+                cfg_col += 1
+                row.grid_columnconfigure(cfg_col, weight=1)
+                cfg_col += 1
+            else:
+                row.grid_columnconfigure(cfg_col, weight=2)
+                cfg_col += 1
+
+            row.grid_columnconfigure(cfg_col, minsize=self.DOT_W)
             row.grid_rowconfigure(0, weight=1)
 
             # Selection accent strip (always in grid, colour toggled)
@@ -181,31 +335,6 @@ class SubtitleList(ctk.CTkFrame):
 
             text_widgets = [index_label, time_label]
 
-            # Speaker column (Feature 4)
-            if has_speakers:
-                spk_name = sub.speaker_id
-                spk_color = COLORS["text_muted"]
-                if sub.speaker_id and sub.speaker_id in speakers:
-                    spk_info = speakers[sub.speaker_id]
-                    spk_name = spk_info.display_name or sub.speaker_id
-                    if spk_info.style:
-                        spk_color = spk_info.style.primary_color
-
-                speaker_fg = spk_color if isinstance(spk_color, str) else self._resolve_color(spk_color)
-                speaker_label = tk.Label(
-                    row,
-                    text=spk_name or "-",
-                    font=(ff, 9, "bold"),
-                    fg=speaker_fg,
-                    bg=row_bg,
-                    anchor="w",
-                    padx=0,
-                    pady=0,
-                )
-                speaker_label.grid(row=0, column=col_idx, padx=(2, 2), sticky="nsew")
-                text_widgets.append(speaker_label)
-                col_idx += 1
-
             # Original text (visible + editable via double-click)
             original_display = sub.original_text.strip() if sub.original_text else ""
             if not original_display and getattr(sub, "words", None):
@@ -213,41 +342,48 @@ class SubtitleList(ctk.CTkFrame):
             if not original_display:
                 original_display = "…"
 
+            original_family = self._pick_text_family(original_display, ff)
+
             orig_label = tk.Label(
                 row,
-                font=(ff, 10),
+                font=(original_family, 10),
                 fg=self._resolve_color(COLORS["text_primary"]),
                 bg=row_bg,
-                text=original_display,
-                anchor="w",
-                justify="left",
-                padx=0,
-                pady=0,
+                text="", width=1, anchor="w", justify="left",
+                padx=0, pady=0, cursor="xterm",
             )
-            orig_label.grid(row=0, column=col_idx, sticky="nsew", padx=(2, 2))
+            orig_label.grid(row=0, column=col_idx, sticky="nsew", padx=(2, 8))
+            setattr(orig_label, "_clip_enabled", True)
+            setattr(orig_label, "_preferred_family", ff)
+            self._set_clipped_label_text(orig_label, original_display)
+            orig_label.bind("<Configure>", lambda e, w=orig_label: self._apply_label_clipping(w))
             orig_label.bind("<Double-Button-1>", lambda e, idx=i: self._start_inline_edit(e.widget, idx, "original"))
             text_widgets.append(orig_label)
             col_idx += 1
 
             # Translation text
             if has_translation:
+                trans_text = (sub.translated_text or "").strip() or "…"
+                translated_family = self._pick_text_family(trans_text, ff)
                 trans_label = tk.Label(
                     row,
-                    font=(ff, 10),
+                    font=(translated_family, 10),
                     fg=self._resolve_color(COLORS["text_secondary"]),
                     bg=row_bg,
-                    text=(sub.translated_text or "").strip() or "…",
-                    anchor="w",
-                    justify="left",
-                    padx=0,
-                    pady=0,
+                    text="", width=1, anchor="w", justify="left",
+                    padx=0, pady=0, cursor="xterm",
                 )
                 trans_label.grid(row=0, column=col_idx, sticky="nsew", padx=(2, 2))
+                setattr(trans_label, "_clip_enabled", True)
+                setattr(trans_label, "_preferred_family", ff)
+                self._set_clipped_label_text(trans_label, trans_text)
+                trans_label.bind("<Configure>", lambda e, w=trans_label: self._apply_label_clipping(w))
                 trans_label.bind("<Double-Button-1>", lambda e, idx=i: self._start_inline_edit(e.widget, idx, "translated"))
                 text_widgets.append(trans_label)
+                col_idx += 1
 
-            # Override style indicator dot (shown if line has style_override)
-            has_override = getattr(sub, 'style_override', None) is not None
+            # Override style indicator dot (shown if the line has any style override)
+            has_override = self.state.subtitle_has_style_override(sub)
             override_dot = tk.Label(
                 row,
                 text="●" if has_override else "○",
@@ -277,6 +413,42 @@ class SubtitleList(ctk.CTkFrame):
             self.rows.append((row, accent_strip, text_widgets))
 
         self._update_selection()
+        # Grid layout settles asynchronously; re-clip after it stabilises.
+        self.after(60, self._reclip_all)
+
+    def _sync_header_columns(self):
+        """Mirror exact grid cell widths from the first row onto the header columns."""
+        if not self.rows:
+            return
+        try:
+            self.update_idletasks()
+            row_frame, _, _ = self.rows[0]
+            row_frame.update_idletasks()
+
+            has_translation = self.state.bilingual and any(
+                s.translated_text for s in self.state.subtitles
+            )
+
+            # (header_col, row_col) — row col indices match _rebuild_list cfg_col order
+            col_pairs = [(1, 1), (2, 2)]   # # and TIME
+            hcol = 3; rcol = 3
+            col_pairs.append((hcol, rcol)); hcol += 1; rcol += 1    # ORIGINAL
+            if has_translation:
+                col_pairs.append((hcol, rcol))                       # TRANSLATION
+
+            for h_col, r_col in col_pairs:
+                bbox = row_frame.grid_bbox(r_col, 0)   # full cell incl. padx
+                if bbox and bbox[2] > 1:
+                    self.col_header.grid_columnconfigure(h_col, weight=0, minsize=bbox[2])
+        except Exception:
+            pass
+
+    def _reclip_all(self):
+        for _, _, widgets in self.rows:
+            for w in widgets:
+                if isinstance(w, tk.Label) and getattr(w, "_clip_enabled", False):
+                    self._apply_label_clipping(w)
+        self._sync_header_columns()
 
     def _on_row_click(self, index):
         self.state.set_selected_subtitle(index)
@@ -284,6 +456,14 @@ class SubtitleList(ctk.CTkFrame):
     def _on_row_hover(self, index, entering):
         if index >= len(self.rows):
             return
+        # Hint logic runs regardless of selection state
+        if entering:
+            if hasattr(self, '_hint_hide_id'):
+                self.after_cancel(self._hint_hide_id)
+            self.hint_label.place(relx=0, rely=1.0, anchor="sw",
+                                  relwidth=1.0, y=-SPACING["xs"])
+        else:
+            self._hint_hide_id = self.after(300, self.hint_label.place_forget)
         row, _, widgets = self.rows[index]
         if index == self.state.selected_subtitle_index:
             return
@@ -373,11 +553,18 @@ class SubtitleList(ctk.CTkFrame):
                     sub.words = []
                 sub.original_text = new_text
                 display = new_text.strip() or "…"
-                label_widget.configure(text=display)
+                preferred = getattr(label_widget, "_preferred_family", get_font_family())
+                family = self._pick_text_family(display, preferred)
+                label_widget.configure(font=(family, 10))
+                self._set_clipped_label_text(label_widget, display)
             else:
                 sub.translated_text = new_text
                 display = new_text.strip() or "…"
-                label_widget.configure(text=display)
+                preferred = getattr(label_widget, "_preferred_family", get_font_family())
+                family = self._pick_text_family(display, preferred)
+                label_widget.configure(font=(family, 10))
+                self._set_clipped_label_text(label_widget, display)
+                self.state.sync_bilingual_with_translations()
             self.state.notify("subtitles_edited")
 
         try:
@@ -429,7 +616,7 @@ class SubtitleList(ctk.CTkFrame):
     def _on_row_right_click(self, event, index):
         self.state.set_selected_subtitle(index)
         menu = tk.Menu(self, tearoff=0)
-        has_override = getattr(self.state.subtitles[index], 'style_override', None) is not None
+        has_override = self.state.subtitle_has_style_override(self.state.subtitles[index])
         menu.add_command(label="Set line style…", command=lambda: self._open_line_style_dialog(index))
         if has_override:
             menu.add_command(label="Clear line style", command=lambda: self._clear_line_style(index))
@@ -442,15 +629,18 @@ class SubtitleList(ctk.CTkFrame):
         if index >= len(self.state.subtitles):
             return
         sub = self.state.subtitles[index]
-        base_style = self.state.get_style_for_subtitle(sub)
+        base_style = self.state.get_primary_style_for_subtitle(sub)
         # If no override yet, clone the current effective style
-        current = sub.style_override if sub.style_override is not None else SubtitleStyle(**base_style.to_dict())
+        current = self.state.get_primary_style_for_subtitle(sub)
         dialog = LineStyleDialog(self, self.state, index, current)
         dialog.grab_set()
 
     def _clear_line_style(self, index):
         if index < len(self.state.subtitles):
-            self.state.subtitles[index].style_override = None
+            sub = self.state.subtitles[index]
+            sub.style_override = None
+            sub.primary_style_override = None
+            sub.secondary_style_override = None
             self.state.notify("subtitles_edited")
             self._rebuild_list()
 
@@ -461,8 +651,8 @@ class SubtitleList(ctk.CTkFrame):
         m = int((total % 3600) // 60)
         s = total % 60
         if h > 0:
-            return f"{h:02d}:{m:02d}:{s:06.3f}"
-        return f"{m:02d}:{s:06.3f}"
+            return f"{h:02d}:{m:02d}:{s:05.2f}"
+        return f"{m:02d}:{s:05.2f}"
 
 
 class LineStyleDialog(ctk.CTkToplevel):
@@ -537,22 +727,23 @@ class LineStyleDialog(ctk.CTkToplevel):
             self.italic_sw.select()
         row += 1
 
-        # Position offset
-        ctk.CTkLabel(self, text="Offset:", font=ctk.CTkFont(family=ff, size=12),
+        # Absolute vertical position
+        ctk.CTkLabel(self, text="Vertical:", font=ctk.CTkFont(family=ff, size=12),
                      text_color=COLORS["text_secondary"]).grid(row=row, column=0, sticky="w", padx=16, pady=(6, 0))
         off_frame = ctk.CTkFrame(self, fg_color="transparent")
         off_frame.grid(row=row, column=1, sticky="ew", padx=16, pady=(6, 0))
         off_frame.grid_columnconfigure(0, weight=1)
         self.offset_slider = ctk.CTkSlider(
-            off_frame, from_=-50, to=50, number_of_steps=100,
+            off_frame, from_=0, to=100, number_of_steps=100,
             progress_color=COLORS["accent"], button_color=COLORS["accent"],
             button_hover_color=COLORS["accent_hover"], fg_color=COLORS["progress_bg"],
             command=self._on_offset_change, height=14,
         )
-        self.offset_slider.set(getattr(self.style, 'position_offset', 0))
+        pos_y = int(getattr(self.style, 'position_y_percent', {"top": 15, "center": 50, "bottom": 85}.get(getattr(self.style, 'position', 'bottom'), 85)))
+        self.offset_slider.set(pos_y)
         self.offset_slider.grid(row=0, column=0, sticky="ew")
         self.offset_label = ctk.CTkLabel(
-            off_frame, text=f"{getattr(self.style, 'position_offset', 0):+d}%",
+            off_frame, text=f"{pos_y}%",
             font=ctk.CTkFont(family=ff, size=11),
             text_color=COLORS["text_secondary"], width=40,
         )
@@ -623,11 +814,13 @@ class LineStyleDialog(ctk.CTkToplevel):
 
     def _on_offset_change(self, value):
         v = int(round(float(value)))
-        self.style.position_offset = v
-        self.offset_label.configure(text=f"{v:+d}%")
+        self.style.position_y_percent = v
+        self.offset_label.configure(text=f"{v}%")
 
     def _apply(self):
         if self.subtitle_index < len(self.state.subtitles):
-            self.state.subtitles[self.subtitle_index].style_override = self.style
+            sub = self.state.subtitles[self.subtitle_index]
+            sub.primary_style_override = self.style
+            sub.style_override = None
             self.state.notify("subtitles_edited")
         self.destroy()

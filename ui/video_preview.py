@@ -8,8 +8,10 @@ import functools
 import threading
 import queue
 from collections import OrderedDict
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageTk, ImageChops
 from app.theme import COLORS, FONTS, SPACING, RADIUS, IconRenderer, get_font_family
+from core.font_catalog import resolve_cached_font_variant, resolve_font_family_name
+from core.subtitle_renderer import SubtitleOverlayRenderer, build_render_params
 from core.subtitle_model import SubtitleStyle
 
 
@@ -18,6 +20,122 @@ from core.subtitle_model import SubtitleStyle
 # ---------------------------------------------------------------------------
 
 _FONT_REGISTRY: dict | None = None  # lazy-loaded: {lowercase_display_name: abs_path}
+
+# Map common localized/display aliases to canonical Windows family names.
+_FONT_ALIAS_MAP = {
+    "\u5b8b\u4f53": "SimSun",
+    "\u65b0\u5b8b\u4f53": "NSimSun",
+    "\u6977\u4f53": "KaiTi",
+    "\u4eff\u5b8b": "FangSong",
+    "\u9ed1\u4f53": "SimHei",
+    "\u5fae\u8f6f\u96c5\u9ed1": "Microsoft YaHei",
+    "\u5fae\u8f6f\u96c5\u9ed1 ui": "Microsoft YaHei UI",
+    "\u5fae\u8f6f\u6b63\u9ed1\u4f53": "Microsoft JhengHei",
+    "\u534e\u6587\u5b8b\u4f53": "STSong",
+    "\u534e\u6587\u4eff\u5b8b": "STFangsong",
+    "\u534e\u6587\u6977\u4f53": "STKaiti",
+    "\u534e\u6587\u4e2d\u5b8b": "STZhongsong",
+    "\u534e\u6587\u884c\u6977": "STXingkai",
+}
+
+
+def _normalize_family_name(family: str) -> str:
+    name = (family or "").strip()
+    if name.startswith("@"):
+        name = name[1:]
+    return re.sub(r"\s+", " ", name)
+
+
+def _canonicalize_family_name(family: str) -> str:
+    normalized = _normalize_family_name(family)
+    if not normalized:
+        return ""
+    resolved = resolve_font_family_name(normalized)
+    if resolved:
+        return resolved
+    return _FONT_ALIAS_MAP.get(normalized.casefold(), normalized)
+
+
+def _contains_cjk(text: str) -> bool:
+    if not text:
+        return False
+    return any(
+        ("\u4e00" <= ch <= "\u9fff")
+        or ("\u3400" <= ch <= "\u4dbf")
+        or ("\u3040" <= ch <= "\u30ff")
+        or ("\uac00" <= ch <= "\ud7af")
+        for ch in text
+    )
+
+
+def _is_likely_cjk_family(family: str) -> bool:
+    name = _canonicalize_family_name(family).lower()
+    cjk_tokens = (
+        "yahei", "simhei", "simsun", "nsimsun", "kaiti", "fangsong",
+        "msyh", "jhenghei", "noto sans cjk", "noto sans sc", "noto serif sc",
+        "source han", "gothic", "meiryo", "malgun", "pingfang", "heiti",
+        "song", "kai",
+    )
+    return any(tok in name for tok in cjk_tokens)
+
+
+
+def _font_family_candidates_for_text(preferred_family: str, text: str) -> list[str]:
+    preferred_raw = _normalize_family_name(preferred_family) or "Arial"
+    preferred = _canonicalize_family_name(preferred_raw) or preferred_raw
+    preferred_variants = [preferred]
+    if preferred_raw.casefold() != preferred.casefold():
+        preferred_variants.append(preferred_raw)
+
+    if _contains_cjk(text):
+        cjk_families = [
+            "SimSun",
+            "Microsoft YaHei UI",
+            "Microsoft YaHei",
+            "SimHei",
+            "Yu Gothic UI",
+            "Meiryo UI",
+        ]
+        # If user explicitly picked a CJK font, try it first; otherwise CJK fallbacks first.
+        if _is_likely_cjk_family(preferred):
+            ordered = preferred_variants + cjk_families + ["Segoe UI", "Arial"]
+        else:
+            ordered = cjk_families + preferred_variants + ["Segoe UI", "Arial"]
+    elif any(ord(ch) > 0x024F for ch in text or ""):
+        ordered = [
+            *preferred_variants,
+            "Segoe UI",
+            "Nirmala UI",
+            "Leelawadee UI",
+            "Arial Unicode MS",
+            "Arial",
+        ]
+    else:
+        ordered = preferred_variants + ["Segoe UI", "Arial", "Tahoma"]
+
+    deduped = []
+    seen = set()
+    for name in ordered:
+        key = name.casefold()
+        if key not in seen:
+            deduped.append(name)
+            seen.add(key)
+    return deduped
+
+
+def _register_font_mapping(registry: dict, raw_name: str, path: str):
+    clean = re.sub(r"\s*\(.*?\)\s*$", "", raw_name).strip()
+    if not clean:
+        return
+    for part in clean.split("&"):
+        name = _normalize_family_name(part)
+        if not name:
+            continue
+        key = name.casefold()
+        registry[key] = path
+        canonical = _canonicalize_family_name(name)
+        if canonical and canonical.casefold() != key:
+            registry.setdefault(canonical.casefold(), path)
 
 
 def _load_font_registry() -> dict:
@@ -28,48 +146,84 @@ def _load_font_registry() -> dict:
     try:
         import winreg
         fonts_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
-        key = winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts",
-        )
-        i = 0
-        while True:
+        key_specs = [
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Fonts"),
+        ]
+
+        for hive, key_path in key_specs:
             try:
-                name, value, _ = winreg.EnumValue(key, i)
-                # Strip trailing "(TrueType)", "(OpenType)" etc.
-                clean = re.sub(r"\s*\(.*?\)\s*$", "", name).strip().lower()
-                path = value if os.path.isabs(value) else os.path.join(fonts_dir, value)
-                _FONT_REGISTRY[clean] = path
-                i += 1
+                key = winreg.OpenKey(hive, key_path)
             except OSError:
-                break
-        winreg.CloseKey(key)
+                continue
+
+            i = 0
+            while True:
+                try:
+                    name, value, _ = winreg.EnumValue(key, i)
+                    i += 1
+                    if not isinstance(value, str):
+                        continue
+                    path = value if os.path.isabs(value) else os.path.join(fonts_dir, value)
+                    _register_font_mapping(_FONT_REGISTRY, name, path)
+                except OSError:
+                    break
+
+            winreg.CloseKey(key)
+
+        # Backfill aliases so localized names resolve when canonical family exists.
+        for alias, canonical in _FONT_ALIAS_MAP.items():
+            canonical_path = _FONT_REGISTRY.get(canonical.casefold())
+            if canonical_path:
+                _FONT_REGISTRY.setdefault(alias.casefold(), canonical_path)
     except Exception:
         pass
     return _FONT_REGISTRY
+
+
 
 
 @functools.lru_cache(maxsize=128)
 def _resolve_font_path(family: str, bold: bool, italic: bool) -> str | None:
     """Return an absolute font file path for the given family + style, or None."""
     registry = _load_font_registry()
+    family_norm = _normalize_family_name(family)
+    if not family_norm:
+        return None
+    family_canonical = _canonicalize_family_name(family_norm)
 
     style_parts = []
     if bold:
         style_parts.append("Bold")
     if italic:
         style_parts.append("Italic")
+    style_suffix = " ".join(style_parts).casefold()
 
-    # Build candidate display names: styled first, then plain family as fallback
-    candidates = []
-    if style_parts:
-        candidates.append((family + " " + " ".join(style_parts)).lower())
-    candidates.append(family.lower())
+    family_bases = [family_canonical, family_norm]
+    deduped_bases = []
+    seen_bases = set()
+    for base in family_bases:
+        k = base.casefold()
+        if base and k not in seen_bases:
+            deduped_bases.append(base)
+            seen_bases.add(k)
 
-    for name in candidates:
-        path = registry.get(name)
-        if path and os.path.exists(path):
-            return path
+    # Try exact family, then progressively drop trailing words to handle
+    # Tk variants like "Arial CE", "Bahnschrift Light Condensed", etc.
+    for raw_base in deduped_bases:
+        words = raw_base.split()
+        for length in range(len(words), 0, -1):
+            base = " ".join(words[:length]).casefold()
+            # Try styled first (e.g. "arial bold"), then plain (e.g. "arial")
+            if style_suffix:
+                path = registry.get(base + " " + style_suffix)
+                if path and os.path.exists(path):
+                    return path
+            path = registry.get(base)
+            if path and os.path.exists(path):
+                return path
+
     return None
 
 
@@ -129,6 +283,7 @@ class VideoPreview(ctk.CTkFrame):
     def __init__(self, parent, state, **kwargs):
         super().__init__(parent, fg_color=COLORS["bg_secondary"], corner_radius=0, **kwargs)
         self.state = state
+        self._subtitle_renderer = SubtitleOverlayRenderer(video_info=self.state.video_info)
 
         # Common playback state
         self._is_playing = False
@@ -139,6 +294,7 @@ class VideoPreview(ctk.CTkFrame):
         # Decide which backend to use
         self._use_mpv = HAS_MPV
         self._mpv_player = None
+        self._mpv_overlay = None
 
         # --------------- fallback (OpenCV/VLC) state ---------------
         self._photo = None            # prevent GC for fallback canvas
@@ -169,6 +325,10 @@ class VideoPreview(ctk.CTkFrame):
         self._subtitle_canvas_image_id = None
         self._prev_sub_index = -2             # sentinel for change detection
         self._prev_word_index = -2
+        self._safe_area_visible_until = 0.0
+        self._safe_area_hint_seconds = 1.0   # fade-out duration
+        self._safe_area_hold_seconds = 0.6   # stay fully visible after last interaction
+        self._safe_area_hide_after_id = None
 
         # --------------- layout ---------------
         self.grid_columnconfigure(0, weight=1)
@@ -339,26 +499,18 @@ class VideoPreview(ctk.CTkFrame):
                 osc=False,
                 input_default_bindings=False,
                 input_vo_keyboard=False,
+                sid=False,
             )
             player.volume = self._volume
             player.mute = self._is_muted
             self._mpv_player = player
-            # Make the subtitle overlay canvas transparent on Windows so the
-            # mpv video in _mpv_frame shows through its background pixels.
-            # WS_EX_LAYERED + LWA_COLORKEY treats all #010101 pixels as
-            # transparent; subtitles drawn in other colours remain visible.
-            if os.name == "nt":
-                try:
-                    import ctypes
-                    _hwnd = self.subtitle_canvas.winfo_id()
-                    _GWL_EXSTYLE = -20
-                    _WS_EX_LAYERED = 0x00080000
-                    _LWA_COLORKEY = 0x00000001
-                    _style = ctypes.windll.user32.GetWindowLongW(_hwnd, _GWL_EXSTYLE)
-                    ctypes.windll.user32.SetWindowLongW(_hwnd, _GWL_EXSTYLE, _style | _WS_EX_LAYERED)
-                    ctypes.windll.user32.SetLayeredWindowAttributes(_hwnd, 0x010101, 0, _LWA_COLORKEY)
-                except Exception:
-                    pass
+            # Use mpv's native image overlay for subtitle rendering.
+            # This gives true per-pixel alpha compositing on the GPU,
+            # so effects like glow with soft edges render correctly
+            # without the colorkey hack (which can't do semi-transparency).
+            self._mpv_overlay = player.create_image_overlay()
+            # Hide the tkinter canvas — mpv overlay replaces it.
+            self.subtitle_canvas.place_forget()
             # Start the subtitle + scrubber update loops
             self._mpv_subtitle_tick()
             self._mpv_scrubber_tick()
@@ -392,12 +544,19 @@ class VideoPreview(ctk.CTkFrame):
     def _on_state_change(self, field):
         if field not in (
             "video", "preview_time", "subtitles", "selected_subtitle",
-            "style", "bilingual", "karaoke_mode", "speakers", "animation_style",
+            "style", "bilingual", "karaoke_mode", "animation_style",
+            "translation_animation_style",
             "karaoke_highlight_color", "transition_duration", "classic_dimmed_opacity",
-            "classic_active_marker", "classic_history_on", "popup_scale", "popup_trail_count",
-            "wordbyw_entry_style", "wordbyw_history_style", "subtitles_edited",
+            "classic_active_marker", "classic_history_on", "popup_trail_count", "popup_min_chars",
+            "wordbyw_entry_style", "wordbyw_history_dim", "subtitles_edited", "text_width_percent",
+            "text_width_release", "position_swap",
         ):
             return
+
+        if field == "text_width_percent":
+            self._show_safe_area_hint()
+        elif field == "text_width_release":
+            self._begin_safe_area_fadeout()
 
         if field == "video":
             self._reset_video_session()
@@ -406,7 +565,7 @@ class VideoPreview(ctk.CTkFrame):
             else:
                 self._setup_audio_player(self.state.video_path)
 
-        if field in ("style", "karaoke_mode", "animation_style", "bilingual", "subtitles_edited"):
+        if field in ("style", "karaoke_mode", "animation_style", "translation_animation_style", "bilingual", "subtitles_edited", "position_swap"):
             if not self._use_mpv:
                 self._scaled_frame_cache.clear()
             # Force subtitle overlay redraw on next tick
@@ -426,8 +585,7 @@ class VideoPreview(ctk.CTkFrame):
 
     def _on_resize(self, event=None):
         if self._use_mpv:
-            # Subtitle overlay resizes automatically via place(relwidth=1, relheight=1).
-            # Force a redraw so the new canvas dimensions are used.
+            # Force a subtitle redraw at the new frame dimensions.
             self._prev_sub_index = -2
         else:
             self._request_render()
@@ -525,7 +683,7 @@ class VideoPreview(ctk.CTkFrame):
         self._mpv_scrubber_after_id = self.after(100, self._mpv_scrubber_tick)
 
     def _mpv_subtitle_tick(self):
-        """50 ms poll: redraw subtitle overlay only when subtitle or word changes."""
+        """50 ms poll: redraw subtitle overlay when subtitle/word changes or animation is active."""
         if not self._use_mpv:
             return
         try:
@@ -548,12 +706,27 @@ class VideoPreview(ctk.CTkFrame):
                         word_index = i
                         break
 
-            if sub_index != self._prev_sub_index or word_index != self._prev_word_index:
+            # During animation, redraw every tick — animation state changes continuously.
+            anim_settings = self.state.get_animation_settings_for_subtitle(sub)
+            anim_needs_redraw = (
+                self._is_playing
+                and sub is not None
+                and anim_settings.karaoke_mode == "off"
+                and anim_settings.animation_style != "none"
+            )
+            safe_area_visible = time.time() <= self._safe_area_visible_until
+            if (
+                anim_needs_redraw
+                or safe_area_visible
+                or sub_index != self._prev_sub_index
+                or word_index != self._prev_word_index
+            ):
                 self._prev_sub_index = sub_index
                 self._prev_word_index = word_index
                 self._mpv_render_subtitle_overlay(t, sub)
-        except Exception:
-            pass
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
 
         self._mpv_subtitle_after_id = self.after(50, self._mpv_subtitle_tick)
 
@@ -562,17 +735,68 @@ class VideoPreview(ctk.CTkFrame):
         self._prev_sub_index = -2
         self._prev_word_index = -2
 
+    def _show_safe_area_hint(self):
+        """Show the guide at full opacity. Cancel any pending fade-out —
+        the fade is only scheduled by _begin_safe_area_fadeout (on mouse release)."""
+        # Push visible_until far into the future so alpha stays at 1.0
+        self._safe_area_visible_until = time.time() + 600
+
+        if self._safe_area_hide_after_id is not None:
+            try:
+                self.after_cancel(self._safe_area_hide_after_id)
+            except Exception:
+                pass
+            self._safe_area_hide_after_id = None
+
+    def _begin_safe_area_fadeout(self):
+        """Called on mouse release — start hold + fade timer."""
+        total = self._safe_area_hold_seconds + self._safe_area_hint_seconds
+        self._safe_area_visible_until = time.time() + total
+
+        if self._safe_area_hide_after_id is not None:
+            try:
+                self.after_cancel(self._safe_area_hide_after_id)
+            except Exception:
+                pass
+            self._safe_area_hide_after_id = None
+
+        self._safe_area_hide_after_id = self.after(
+            int(total * 1000),
+            self._hide_safe_area_hint,
+        )
+
+    def _hide_safe_area_hint(self):
+        self._safe_area_hide_after_id = None
+        self._safe_area_visible_until = 0.0
+
+        if self._use_mpv:
+            try:
+                current_t = self._mpv_player.time_pos if self._mpv_player is not None else None
+            except Exception:
+                current_t = None
+            if current_t is None:
+                current_t = self.state.preview_time
+            sub = self.state.get_subtitle_at_time(current_t)
+            self._mpv_force_subtitle_redraw()
+            self._mpv_render_subtitle_overlay(current_t, sub)
+        else:
+            self._request_render()
+
+    def _current_safe_area_alpha(self) -> float:
+        remaining = self._safe_area_visible_until - time.time()
+        if remaining <= 0:
+            return 0.0
+        # Hold at full opacity during the hold period, then fade out
+        fade_dur = self._safe_area_hint_seconds
+        if remaining > fade_dur:
+            return 1.0  # still in the hold period
+        return max(0.0, min(1.0, remaining / fade_dur))
+
     def _mpv_render_subtitle_overlay(self, current_time: float, sub):
-        """Render a subtitle PIL image and display it on the overlay canvas."""
-        cw = self.subtitle_canvas.winfo_width()
-        ch = self.subtitle_canvas.winfo_height()
+        """Render a subtitle PIL image and push it to mpv's native overlay."""
+        cw = self._mpv_frame.winfo_width()
+        ch = self._mpv_frame.winfo_height()
         if cw < 10 or ch < 10:
-            return
-
-        self.subtitle_canvas.delete("all")
-        self._subtitle_canvas_image_id = None
-
-        if sub is None:
             return
 
         params = self._snapshot_render_params_for_overlay(cw, ch, current_time, sub)
@@ -581,58 +805,30 @@ class VideoPreview(ctk.CTkFrame):
         overlay = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
         overlay = self._render_subtitle_onto_overlay(overlay, sub, params)
 
-        if overlay is not None:
-            self._subtitle_photo = ImageTk.PhotoImage(overlay)
-            self._subtitle_canvas_image_id = self.subtitle_canvas.create_image(
-                0, 0, image=self._subtitle_photo, anchor="nw"
-            )
+        if overlay is not None and hasattr(self, '_mpv_overlay') and self._mpv_overlay is not None:
+            self._mpv_overlay.update(overlay)
+        elif hasattr(self, '_mpv_overlay') and self._mpv_overlay is not None:
+            # Clear: push a 1×1 transparent image
+            self._mpv_overlay.update(Image.new("RGBA", (1, 1), (0, 0, 0, 0)))
 
     def _snapshot_render_params_for_overlay(self, cw: int, ch: int, current_time: float, sub) -> dict:
         """Build the params dict for subtitle rendering onto the transparent overlay."""
-        return {
-            "video_path": self.state.video_path,
-            "preview_time": current_time,
-            "canvas_w": cw,
-            "canvas_h": ch,
-            "subtitle": sub,
-            "karaoke_mode": self.state.karaoke_mode,
-            "animation_style": getattr(self.state, "animation_style", "none"),
-            "transition_duration": getattr(self.state, "transition_duration", 0.30),
-            "karaoke_highlight_color": getattr(self.state, "karaoke_highlight_color", "#FFFF00"),
-            "classic_dimmed_opacity": getattr(self.state, "classic_dimmed_opacity", 0.5),
-            "classic_active_marker": getattr(self.state, "classic_active_marker", "color"),
-            "classic_history_on": getattr(self.state, "classic_history_on", False),
-            "popup_scale": getattr(self.state, "popup_scale", 1.5),
-            "popup_trail_count": getattr(self.state, "popup_trail_count", 3),
-            "wordbyw_entry_style": getattr(self.state, "wordbyw_entry_style", "instant"),
-            "wordbyw_history_style": getattr(self.state, "wordbyw_history_style", "full"),
-            "bilingual": self.state.bilingual,
-            "secondary_on_top": self.state.secondary_on_top,
-            "secondary_style": self.state.secondary_style,
-            "is_playing": self._is_playing,
-            "style": self.state.get_style_for_subtitle(sub) if sub else self.state.primary_style,
-            "video_info": self.state.video_info,
-        }
+        return build_render_params(
+            self.state,
+            current_time,
+            sub,
+            cw,
+            ch,
+            is_playing=self._is_playing,
+            safe_area_alpha=self._current_safe_area_alpha(),
+        )
 
     def _render_subtitle_onto_overlay(self, overlay: Image.Image, sub, params: dict) -> Image.Image:
         """
         Dispatch to the correct karaoke/subtitle drawing method.
         The input overlay is an RGBA image; returns the modified overlay.
         """
-        if sub is None:
-            return overlay
-
-        karaoke = params["karaoke_mode"]
-
-        if karaoke == "classic" and getattr(sub, "words", None):
-            return self._draw_karaoke_classic(overlay, sub, params)
-        elif karaoke == "popup" and getattr(sub, "words", None):
-            return self._draw_karaoke_popup(overlay, sub, params)
-        elif karaoke == "word_by_word" and getattr(sub, "words", None):
-            return self._draw_karaoke_word_by_word(overlay, sub, params)
-        else:
-            effect = self._compute_anim_effect(sub, params)
-            return self._draw_subtitle(overlay, sub, params, effect=effect)
+        return self._subtitle_renderer.render_on_image(overlay, sub, params)
 
     # =========================================================================
     # Playback controls (unified interface)
@@ -756,6 +952,13 @@ class VideoPreview(ctk.CTkFrame):
         if event is not None and event.widget is not self:
             return
 
+        if self._safe_area_hide_after_id is not None:
+            try:
+                self.after_cancel(self._safe_area_hide_after_id)
+            except Exception:
+                pass
+            self._safe_area_hide_after_id = None
+
         self._pause_playback(update_button=False)
 
         # Cancel all pending after() callbacks
@@ -822,30 +1025,15 @@ class VideoPreview(ctk.CTkFrame):
     def _snapshot_render_params(self, cw: int, ch: int) -> dict:
         """Snapshot all state needed for rendering (called on main thread)."""
         sub = self.state.get_subtitle_at_time(self.state.preview_time)
-        return {
-            "video_path": self.state.video_path,
-            "preview_time": self.state.preview_time,
-            "canvas_w": cw,
-            "canvas_h": ch,
-            "subtitle": sub,
-            "karaoke_mode": self.state.karaoke_mode,
-            "animation_style": getattr(self.state, "animation_style", "none"),
-            "transition_duration": getattr(self.state, "transition_duration", 0.30),
-            "karaoke_highlight_color": getattr(self.state, "karaoke_highlight_color", "#FFFF00"),
-            "classic_dimmed_opacity": getattr(self.state, "classic_dimmed_opacity", 0.5),
-            "classic_active_marker": getattr(self.state, "classic_active_marker", "color"),
-            "classic_history_on": getattr(self.state, "classic_history_on", False),
-            "popup_scale": getattr(self.state, "popup_scale", 1.5),
-            "popup_trail_count": getattr(self.state, "popup_trail_count", 3),
-            "wordbyw_entry_style": getattr(self.state, "wordbyw_entry_style", "instant"),
-            "wordbyw_history_style": getattr(self.state, "wordbyw_history_style", "full"),
-            "bilingual": self.state.bilingual,
-            "secondary_on_top": self.state.secondary_on_top,
-            "secondary_style": self.state.secondary_style,
-            "is_playing": self._is_playing,
-            "style": self.state.get_style_for_subtitle(sub) if sub else self.state.primary_style,
-            "video_info": self.state.video_info,
-        }
+        return build_render_params(
+            self.state,
+            self.state.preview_time,
+            sub,
+            cw,
+            ch,
+            is_playing=self._is_playing,
+            safe_area_alpha=self._current_safe_area_alpha(),
+        )
 
     def _render_worker(self):
         """Daemon thread: consume render params, produce PIL images."""
@@ -893,20 +1081,7 @@ class VideoPreview(ctk.CTkFrame):
         if img is None:
             return None
 
-        sub = params["subtitle"]
-        if sub:
-            karaoke = params["karaoke_mode"]
-            if karaoke == "classic" and sub.words:
-                img = self._draw_karaoke_classic(img, sub, params)
-            elif karaoke == "popup" and sub.words:
-                img = self._draw_karaoke_popup(img, sub, params)
-            elif karaoke == "word_by_word" and sub.words:
-                img = self._draw_karaoke_word_by_word(img, sub, params)
-            else:
-                effect = self._compute_anim_effect(sub, params)
-                img = self._draw_subtitle(img, sub, params, effect=effect)
-
-        return img
+        return self._subtitle_renderer.render_on_image(img, params["subtitle"], params)
 
     def _extract_frame(self, time_seconds: float, video_path: str, video_info: dict) -> Image.Image | None:
         if not self._ensure_capture(video_path):
@@ -1108,28 +1283,86 @@ class VideoPreview(ctk.CTkFrame):
     # Subtitle font / text helpers (shared by both backends)
     # =========================================================================
 
-    def _get_font(self, style: SubtitleStyle, img_h: int, size_override: int = None, scale: float = 1.0):
+    @staticmethod
+    def _tag_font(font, want_bold: bool, want_italic: bool,
+                  got_variant: str = "regular"):
+        """Set _fake_bold / _fake_italic flags on a loaded PIL font."""
+        got_bold = "bold" in got_variant
+        got_italic = "italic" in got_variant
+        font._fake_bold = want_bold and not got_bold
+        font._fake_italic = want_italic and not got_italic
+        return font
+
+    def _get_font(self, style: SubtitleStyle, img_h: int, size_override: int = None,
+                  scale: float = 1.0, sample_text: str = ""):
         base = size_override or max(12, int(style.font_size * img_h / 1080))
         font_size = max(4, int(base * scale))
+        want_bold = style.bold
+        want_italic = style.italic
+        family_candidates = _font_family_candidates_for_text(style.font_family, sample_text)
+        for family in family_candidates:
+            cached_variant = resolve_cached_font_variant(family, want_bold, want_italic)
+            if cached_variant:
+                try:
+                    font = ImageFont.truetype(
+                        cached_variant["path"],
+                        font_size,
+                        index=int(cached_variant.get("index", 0)),
+                    )
+                    return self._tag_font(font, want_bold, want_italic,
+                                          cached_variant.get("variant", "regular"))
+                except OSError:
+                    pass
 
-        path = _resolve_font_path(style.font_family, style.bold, style.italic)
-        if path:
-            try:
-                return ImageFont.truetype(path, font_size)
-            except OSError:
-                pass
+            path = _resolve_font_path(family, want_bold, want_italic)
+            if path:
+                try:
+                    font = ImageFont.truetype(path, font_size)
+                    # _resolve_font_path tries styled first; if it returned a match
+                    # for the styled request, assume the variant is correct.
+                    return self._tag_font(font, want_bold, want_italic,
+                                          ("bold_" if want_bold else "")
+                                          + ("italic" if want_italic else "")
+                                          or "regular")
+                except OSError:
+                    pass
+
+            if want_bold or want_italic:
+                cached_plain = resolve_cached_font_variant(family, False, False)
+                if cached_plain:
+                    try:
+                        font = ImageFont.truetype(
+                            cached_plain["path"],
+                            font_size,
+                            index=int(cached_plain.get("index", 0)),
+                        )
+                        return self._tag_font(font, want_bold, want_italic, "regular")
+                    except OSError:
+                        pass
+
+                plain_path = _resolve_font_path(family, False, False)
+                if plain_path:
+                    try:
+                        font = ImageFont.truetype(plain_path, font_size)
+                        return self._tag_font(font, want_bold, want_italic, "regular")
+                    except OSError:
+                        pass
 
         fallbacks = ["msyh.ttc", "simhei.ttf", "arial.ttf", "msgothic.ttc"]
         for f_name in fallbacks:
             try:
-                return ImageFont.truetype(f_name, font_size)
+                font = ImageFont.truetype(f_name, font_size)
+                return self._tag_font(font, want_bold, want_italic, "regular")
             except OSError:
                 continue
 
-        return ImageFont.load_default()
+        font = ImageFont.load_default()
+        font._fake_bold = False
+        font._fake_italic = False
+        return font
 
-    def _compute_anim_effect(self, sub, params: dict) -> dict:
-        anim = params["animation_style"]
+    def _compute_anim_effect(self, sub, params: dict, anim_style_override=None) -> dict:
+        anim = anim_style_override or params["animation_style"]
         if anim == "none":
             return {}
         if not params["is_playing"]:
@@ -1147,7 +1380,10 @@ class VideoPreview(ctk.CTkFrame):
         if anim == "fade":
             return {"type": "fade", "alpha": min(min(1.0, t_in / dur), min(1.0, t_out / (dur * 0.67)))}
         elif anim == "pop":
-            return {"type": "pop", "scale": min(1.0, t_in / dur) if t_in < dur else 1.0}
+            progress = min(1.0, t_in / dur) if t_in < dur else 1.0
+            # Ease-out quad; start from 0.5x so text is always legible.
+            ease = 1.0 - (1.0 - progress) ** 2
+            return {"type": "pop", "scale": 0.5 + 0.5 * ease}
         elif anim == "slide_up":
             return {"type": "slide_up", "y_offset": int(60 * max(0.0, 1.0 - t_in / dur)) if t_in < dur else 0}
         elif anim == "typewriter":
@@ -1164,6 +1400,60 @@ class VideoPreview(ctk.CTkFrame):
     # the transparent overlay background is maintained correctly.
     # =========================================================================
 
+    def _draw_bilingual_translation(self, img: Image.Image, sub, params: dict,
+                                     primary_bottom_y: int | None = None) -> Image.Image:
+        """Render ONLY the translated text (for karaoke modes) below the primary text.
+
+        If primary_bottom_y is given the translation is placed at that Y coordinate
+        (i.e. directly below the primary block).  Otherwise it falls back to the
+        secondary style's own position — but that typically overlaps the primary, so
+        callers should always supply primary_bottom_y when possible.
+        """
+        if not (params.get("bilingual") and getattr(sub, "translated_text", "")):
+            return img
+        style = params["secondary_style"]
+        w, h = img.size
+        trans_anim = params.get("translation_animation_style", "none")
+
+        effect = {}
+        if trans_anim != "none":
+            effect = self._compute_anim_effect(sub, params, anim_style_override=trans_anim)
+
+        scale = effect.get("scale", 1.0)
+        anim_y_offset = effect.get("y_offset", 0)
+
+        # Measure translation block height for absolute-Y placement
+        gap = 10
+        if primary_bottom_y is not None:
+            abs_y = primary_bottom_y + gap + anim_y_offset
+        else:
+            abs_y = None
+
+        def _render_translation(target: Image.Image) -> Image.Image:
+            """Draw translation text onto *target* at the computed position."""
+            if abs_y is not None:
+                return self._draw_stacked_texts_at_y(
+                    target, [(sub.translated_text, style)], w, h,
+                    y_start=abs_y, scale=scale,
+                )
+            return self._draw_stacked_texts(
+                target, [(sub.translated_text, style)], w, h,
+                scale=scale, y_offset=anim_y_offset,
+            )
+
+        if effect.get("type") == "fade":
+            alpha = effect.get("alpha", 1.0)
+            trans_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            trans_layer = _render_translation(trans_layer)
+            r, g, b, a = trans_layer.split()
+            a = a.point(lambda p: int(p * alpha))
+            trans_layer = Image.merge("RGBA", (r, g, b, a))
+            if img.mode == "RGBA":
+                return Image.alpha_composite(img, trans_layer)
+            return Image.alpha_composite(img.convert("RGBA"), trans_layer).convert(img.mode)
+
+        return _render_translation(img)
+
     def _draw_subtitle(self, img: Image.Image, sub, params: dict, effect: dict = None) -> Image.Image:
         anim_type = (effect or {}).get("type", "none")
 
@@ -1174,7 +1464,6 @@ class VideoPreview(ctk.CTkFrame):
             sub = SimpleNamespace(
                 original_text=sub.original_text[:n],
                 translated_text=getattr(sub, "translated_text", ""),
-                speaker_id=getattr(sub, "speaker_id", ""),
                 style_override=getattr(sub, "style_override", None),
             )
             effect = None
@@ -1184,12 +1473,19 @@ class VideoPreview(ctk.CTkFrame):
 
         if anim_type == "fade":
             alpha = effect.get("alpha", 1.0)
-            base = img.copy()
-            rendered = self._draw_subtitle_content(img.copy(), sub, params, scale=scale, y_offset=y_offset)
-            # Blend preserving original mode
             orig_mode = img.mode
-            blended = Image.blend(base.convert("RGBA"), rendered.convert("RGBA"), alpha)
-            return blended if orig_mode == "RGBA" else blended.convert(orig_mode)
+            rendered = self._draw_subtitle_content(img.copy(), sub, params, scale=scale, y_offset=y_offset)
+            if orig_mode == "RGBA":
+                # Transparent overlay (mpv): scale alpha-only so RGB stays at full
+                # intensity — Image.blend would darken text via the near-black canvas bg.
+                r, g, b, a = rendered.convert("RGBA").split()
+                a = a.point(lambda p: int(p * alpha))
+                return Image.merge("RGBA", (r, g, b, a))
+            else:
+                # Opaque video frame (fallback): blend frame with subtitle layer.
+                base = img.copy()
+                blended = Image.blend(base.convert("RGBA"), rendered.convert("RGBA"), alpha)
+                return blended.convert(orig_mode)
 
         return self._draw_subtitle_content(img, sub, params, scale=scale, y_offset=y_offset)
 
@@ -1200,38 +1496,79 @@ class VideoPreview(ctk.CTkFrame):
 
         primary_style = params["style"]
 
-        texts = []
-        if params["secondary_on_top"]:
-            if params["bilingual"] and sub.translated_text:
-                texts.append((sub.translated_text, params["secondary_style"]))
-            texts.append((sub.original_text, primary_style))
-        else:
-            texts.append((sub.original_text, primary_style))
-            if params["bilingual"] and sub.translated_text:
-                texts.append((sub.translated_text, params["secondary_style"]))
+        texts = [(sub.original_text, primary_style)]
+        if params["bilingual"] and getattr(sub, "translated_text", ""):
+            texts.append((sub.translated_text, params["secondary_style"]))
 
-        pos_groups = {"top": [], "center": [], "bottom": []}
-        for text, style in texts:
-            pos_groups[style.position].append((text, style))
+        # When swapped, reverse rendering order so secondary becomes the anchor item (i=0).
+        swapped = params.get("position_swapped", False)
+        if swapped and len(texts) > 1:
+            texts = [texts[1], texts[0]]
 
-        for pos, items in pos_groups.items():
-            img = self._draw_stacked_texts(img, items, pos, w, h, scale=scale, y_offset=y_offset)
+        # Render all items in one call (no position grouping) so that:
+        # 1. Secondary is always i=1 with consistent top-anchor regardless of preset combo
+        # 2. Overlap prevention always applies between primary and secondary
+        img = self._draw_stacked_texts(img, texts, w, h, scale=scale, y_offset=y_offset)
 
         return img
 
-    def _compute_y_base(self, position: str, style: SubtitleStyle, total_stack_h: int,
-                         img_h: int, y_offset: int = 0) -> int:
-        """Compute y start for a text stack, incorporating position_offset."""
-        offset_px = int(img_h * getattr(style, "position_offset", 0) / 100)
-        if position == "top":
-            base = int(img_h * 0.10)
-        elif position == "center":
-            base = (img_h - total_stack_h) // 2
-        else:
-            base = int(img_h * 0.90) - total_stack_h
-        return base + y_offset + offset_px
+    @staticmethod
+    def _style_vertical_percent(style: SubtitleStyle) -> int:
+        if hasattr(style, "position_y_percent"):
+            try:
+                return max(0, min(100, int(getattr(style, "position_y_percent"))))
+            except Exception:
+                pass
+        base = {"top": 15, "center": 50, "bottom": 85}.get(getattr(style, "position", "bottom"), 85)
+        legacy_offset = int(getattr(style, "position_offset", 0))
+        return max(0, min(100, base + legacy_offset))
 
-    def _draw_stacked_texts(self, img: Image.Image, items, position: str,
+    def _video_content_rect(self, img_w: int, img_h: int) -> tuple[int, int, int, int]:
+        """Return (x, y, w, h) of the actual video content area within the overlay/canvas.
+
+        When the video aspect ratio differs from the canvas, mpv (and _fit_image)
+        letterbox the video — this computes where the video actually sits so that
+        subtitle positioning maps 0-100% to the video area, not the black bars.
+        """
+        vi = getattr(self, 'state', None) and getattr(self.state, 'video_info', None)
+        vid_w = (vi or {}).get("width", 0)
+        vid_h = (vi or {}).get("height", 0)
+        if vid_w <= 0 or vid_h <= 0 or img_w <= 0 or img_h <= 0:
+            return 0, 0, img_w, img_h
+        ratio = min(img_w / vid_w, img_h / vid_h)
+        content_w = int(vid_w * ratio)
+        content_h = int(vid_h * ratio)
+        offset_x = (img_w - content_w) // 2
+        offset_y = (img_h - content_h) // 2
+        return offset_x, offset_y, content_w, content_h
+
+    def _compute_y_base(self, position: str, style: SubtitleStyle, total_stack_h: int,
+                         img_h: int, y_offset: int = 0, img_w: int = 0,
+                         anchor: str | None = None) -> int:
+        """Compute y start using anchor-based positioning within the video content area.
+
+        anchor = "bottom": slider % = bottom edge, text grows upward.
+        anchor = "top":    slider % = top edge, text grows downward.
+        Default is "bottom" — position name describes screen location, not anchor.
+        """
+        pos_pct = self._style_vertical_percent(style)
+        _, vid_y, _, vid_h = self._video_content_rect(img_w or img_h, img_h)
+        if vid_h <= 0:
+            vid_y, vid_h = 0, img_h
+
+        if anchor is None:
+            anchor = "bottom"
+
+        anchor_px = vid_y + int(vid_h * pos_pct / 100)
+
+        if anchor == "top":
+            y = anchor_px
+        else:
+            y = anchor_px - total_stack_h
+
+        return y + y_offset
+
+    def _draw_stacked_texts(self, img: Image.Image, items,
                             img_w: int, img_h: int, scale: float = 1.0, y_offset: int = 0) -> Image.Image:
         if not items:
             return img
@@ -1254,17 +1591,28 @@ class VideoPreview(ctk.CTkFrame):
             total_stack_h += block_h + gap
         total_stack_h -= gap
 
-        first_style = items[0][1]
-        current_y = self._compute_y_base(position, first_style, total_stack_h, img_h, y_offset)
-
+        # Each item uses its own style.position and position_y_percent.
+        # i=0 always uses bottom-anchor (slider % = bottom edge, text grows up).
+        # i>0 always uses top-anchor (slider % = top edge, text grows down).
+        # Position name ("top"/"center"/"bottom") describes screen location, not anchor.
+        # Swap is handled by reordering items in the caller.
         render_items = []
-        for block in blocks:
-            line_y = current_y
+        prev_bottom_y = None
+        for i, block in enumerate(blocks):
+            item_anchor = "bottom" if i == 0 else "top"
+            block_y = self._compute_y_base(
+                block["style"].position, block["style"], block["h"], img_h, y_offset, img_w,
+                anchor=item_anchor,
+            )
+            # Prevent overlap: push subsequent items below the previous block's bottom edge.
+            if i > 0 and prev_bottom_y is not None:
+                block_y = max(block_y, prev_bottom_y + 4)
+            prev_bottom_y = block_y + block["h"]
+            line_y = block_y
             for line_text, line_w, line_h in block["lines"]:
                 x = (img_w - line_w) // 2
                 render_items.append((block["style"], block["font"], line_text, x, line_y, line_w, line_h))
                 line_y += line_h + 2
-            current_y += block["h"] + gap
 
         # Batch backgrounds in one composite pass
         if any(item[0].background_enabled for item in render_items):
@@ -1281,46 +1629,164 @@ class VideoPreview(ctk.CTkFrame):
             img = Image.alpha_composite(img, overlay)
             draw = ImageDraw.Draw(img)
 
-        _DIR8 = [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)]
-        for style, font, text, x, y, w, h in render_items:
-            img = self._apply_glow(img, style, font, text, x, y)
-            img = self._apply_shadow(img, style, font, text, x, y)
-            draw = ImageDraw.Draw(img)
-            t = style.outline_thickness
-            if t > 0:
-                oc = self._hex_to_rgb(style.outline_color)
-                for dx, dy in _DIR8:
-                    draw.text((x + dx * t, y + dy * t), text, font=font, fill=oc)
-            draw.text((x, y), text, font=font, fill=self._hex_to_rgb(style.primary_color))
+        img = self._render_text_items(img, render_items)
 
         if orig_mode != "RGBA":
             img = img.convert(orig_mode)
 
         return img
 
+    def _draw_stacked_texts_at_y(self, img: Image.Image, items, img_w: int, img_h: int,
+                                  y_start: int, scale: float = 1.0) -> Image.Image:
+        """Like _draw_stacked_texts but places the block at an absolute y_start."""
+        if not items:
+            return img
+        orig_mode = img.mode
+        if orig_mode != "RGBA":
+            img = img.convert("RGBA")
+
+        draw = ImageDraw.Draw(img)
+        gap = 10
+        blocks = []
+        for text, style in items:
+            font, lines, block_w, block_h = self._prepare_text_block(
+                draw, text, style, img_w, img_h, scale=scale
+            )
+            blocks.append({"style": style, "font": font, "lines": lines, "w": block_w, "h": block_h})
+
+        current_y = max(0, min(y_start, img_h - 10))
+
+        render_items = []
+        for block in blocks:
+            line_y = current_y
+            for line_text, line_w, line_h in block["lines"]:
+                x = (img_w - line_w) // 2
+                render_items.append((block["style"], block["font"], line_text, x, line_y, line_w, line_h))
+                line_y += line_h + 2
+            current_y += block["h"] + gap
+
+        if any(item[0].background_enabled for item in render_items):
+            overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            ov_draw = ImageDraw.Draw(overlay)
+            pad = 6
+            for style, _, _, x, y, w, h in render_items:
+                if style.background_enabled:
+                    bg = self._hex_to_rgb(style.background_color)
+                    op = int(style.background_opacity * 255)
+                    ov_draw.rounded_rectangle(
+                        [x - pad, y - 2, x + w + pad, y + h + 2], radius=4, fill=(*bg, op)
+                    )
+            img = Image.alpha_composite(img, overlay)
+            draw = ImageDraw.Draw(img)
+
+        img = self._render_text_items(img, render_items)
+
+        if orig_mode != "RGBA":
+            img = img.convert(orig_mode)
+        return img
+
+    def _render_text_items(self, img, render_items):
+        """Render glow/shadow/outline/text for a list of render_items with fake bold/italic."""
+        _DIR8 = [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)]
+        for style, font, text, x, y, w, h in render_items:
+            img = self._apply_glow(img, style, font, text, x, y)
+            img = self._apply_shadow(img, style, font, text, x, y)
+            if getattr(font, '_fake_italic', False):
+                img = self._render_text_block_italic(img, style, font, text, x, y)
+            else:
+                draw = ImageDraw.Draw(img)
+                t = style.outline_thickness
+                if t > 0:
+                    oc = self._hex_to_rgb(style.outline_color)
+                    for dx, dy in _DIR8:
+                        self._fb_text(draw, (x + dx * t, y + dy * t), text, font, oc)
+                self._fb_text(draw, (x, y), text, font, self._hex_to_rgb(style.primary_color))
+        return img
+
+    # ------------------------------------------------------------------
+    # Fake bold / italic helpers
+    # ------------------------------------------------------------------
+
+    _ITALIC_SHEAR = 0.20  # ~11.3°, matches libass ITALIC_SLANT
+
+    @staticmethod
+    def _fb_text(draw, xy, text, font, fill, **kw):
+        """draw.text() with fake-bold support (draws twice at +1px offset)."""
+        draw.text(xy, text, font=font, fill=fill, **kw)
+        if getattr(font, '_fake_bold', False):
+            draw.text((xy[0] + 1, xy[1]), text, font=font, fill=fill, **kw)
+
+    def _shear_italic(self, layer: Image.Image, y_center: int) -> Image.Image:
+        """Apply italic shear to an RGBA layer, centred vertically at y_center."""
+        w, h = layer.size
+        return layer.transform(
+            (w, h), Image.AFFINE,
+            (1, self._ITALIC_SHEAR, -self._ITALIC_SHEAR * y_center, 0, 1, 0),
+            resample=Image.BILINEAR,
+        )
+
+    def _render_text_block_italic(self, img, style, font, text, x, y):
+        """Render outline + fill text with fake italic onto img. Returns img."""
+        bbox = font.getbbox(text)
+        th = bbox[3] - bbox[1]
+        y_center = y + th // 2
+        layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        ld = ImageDraw.Draw(layer)
+        t = style.outline_thickness
+        _DIR8 = [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)]
+        if t > 0:
+            oc = self._hex_to_rgb(style.outline_color)
+            for dx, dy in _DIR8:
+                self._fb_text(ld, (x + dx * t, y + dy * t), text, font, oc)
+        self._fb_text(ld, (x, y), text, font, self._hex_to_rgb(style.primary_color))
+        layer = self._shear_italic(layer, y_center)
+        return Image.alpha_composite(img.convert("RGBA"), layer)
+
     # ------------------------------------------------------------------
     # Glow and Shadow helpers
     # ------------------------------------------------------------------
+
+    def _glow_shadow_y_center(self, font, text, y):
+        """Compute vertical centre of text for italic shear."""
+        bbox = font.getbbox(text)
+        return y + (bbox[3] - bbox[1]) // 2
 
     def _apply_glow(self, img: Image.Image, style: SubtitleStyle,
                     font, text: str, x: int, y: int) -> Image.Image:
         if not getattr(style, "glow_enabled", False):
             return img
-        # Use a minimum radius of 8 so the halo extends visibly past the text edge.
-        radius = max(8, getattr(style, "glow_radius", 8))
+        radius = max(4, getattr(style, "glow_radius", 8))
         glow_color = self._hex_to_rgb(getattr(style, "glow_color", "#FFFFFF"))
 
-        # Draw text once at full alpha then blur — this produces a soft halo that
-        # radiates outward from the text boundary. Multiple passes saturate the
-        # center to an opaque solid blob and must be avoided.
-        glow_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        gd = ImageDraw.Draw(glow_layer)
-        gd.text((x, y), text, font=font, fill=(*glow_color, 255))
-        blurred = glow_layer.filter(ImageFilter.GaussianBlur(radius))
+        # Build a greyscale text mask, blur it, then subtract the *filled* shape.
+        # Using a filled mask (small blur + threshold) closes letter counters
+        # (inside of O, B, D, …) so glow only appears OUTSIDE the text boundary.
+        text_mask = Image.new("L", img.size, 0)
+        mask_draw = ImageDraw.Draw(text_mask)
+        mask_draw.text((x, y), text, font=font, fill=255)
+        if getattr(font, '_fake_bold', False):
+            mask_draw.text((x + 1, y), text, font=font, fill=255)
+        fill_blur = max(3, radius // 2)
+        filled_mask = text_mask.filter(ImageFilter.GaussianBlur(fill_blur))
+        filled_mask = filled_mask.point(lambda p: 255 if p > 20 else 0)
+
+        blurred_a = text_mask.filter(ImageFilter.GaussianBlur(radius))
+        outer_a = ImageChops.subtract(blurred_a, filled_mask)
+        # Amplify glow intensity for visibility.
+        outer_a = outer_a.point(lambda p: min(255, p * 2))
+
+        glow_layer = Image.merge("RGBA", (
+            Image.new("L", img.size, glow_color[0]),
+            Image.new("L", img.size, glow_color[1]),
+            Image.new("L", img.size, glow_color[2]),
+            outer_a,
+        ))
+        if getattr(font, '_fake_italic', False):
+            glow_layer = self._shear_italic(glow_layer, self._glow_shadow_y_center(font, text, y))
 
         orig_mode = img.mode
         base = img.convert("RGBA")
-        result = Image.alpha_composite(base, blurred)
+        result = Image.alpha_composite(base, glow_layer)
         return result if orig_mode == "RGBA" else result.convert(orig_mode)
 
     def _apply_shadow(self, img: Image.Image, style: SubtitleStyle,
@@ -1334,9 +1800,11 @@ class VideoPreview(ctk.CTkFrame):
 
         shadow_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
         sd = ImageDraw.Draw(shadow_layer)
-        sd.text((x + sx, y + sy), text, font=font, fill=(*sc, 220))
+        self._fb_text(sd, (x + sx, y + sy), text, font, (*sc, 220))
         if blur > 0:
             shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(blur))
+        if getattr(font, '_fake_italic', False):
+            shadow_layer = self._shear_italic(shadow_layer, self._glow_shadow_y_center(font, text, y))
 
         orig_mode = img.mode
         base = img.convert("RGBA")
@@ -1358,7 +1826,7 @@ class VideoPreview(ctk.CTkFrame):
         current_time = params["preview_time"]
 
         style = params["style"]
-        font = self._get_font(style, h)
+        font = self._get_font(style, h, sample_text=(sub.original_text or ""))
 
         words = self._get_karaoke_words(sub)
         if not words:
@@ -1366,7 +1834,6 @@ class VideoPreview(ctk.CTkFrame):
             return result if orig_mode == "RGBA" else result.convert(orig_mode)
 
         word_metrics = []
-        total_w = 0
         space_w = draw.textbbox((0, 0), " ", font=font)[2] - draw.textbbox((0, 0), " ", font=font)[0]
 
         for i, we in enumerate(words):
@@ -1380,24 +1847,33 @@ class VideoPreview(ctk.CTkFrame):
                 "text": text, "w": tw, "h": th,
                 "start": we["start"], "end": we["end"], "index": i,
             })
-            total_w += tw + (space_w if i < len(words) - 1 else 0)
 
         if not word_metrics:
             result = self._draw_subtitle(img, sub, params)
             return result if orig_mode == "RGBA" else result.convert(orig_mode)
 
-        max_h = max(m["h"] for m in word_metrics)
-        offset_px = int(h * getattr(style, "position_offset", 0) / 100)
+        max_width = max(1, int(w * max(0, min(100, int(getattr(style, "text_width_percent", 90)))) / 100))
+        line_gap = 4
+        lines = []  # [(line_words, line_width, line_height)]
+        cur_line = []
+        cur_w = 0
+        cur_h = 0
+        for metric in word_metrics:
+            add_w = metric["w"] if not cur_line else (space_w + metric["w"])
+            if cur_line and (cur_w + add_w) > max_width:
+                lines.append((cur_line, cur_w, cur_h))
+                cur_line = [metric]
+                cur_w = metric["w"]
+                cur_h = metric["h"]
+            else:
+                cur_line.append(metric)
+                cur_w += add_w
+                cur_h = max(cur_h, metric["h"])
+        if cur_line:
+            lines.append((cur_line, cur_w, cur_h))
 
-        if style.position == "top":
-            y = int(h * 0.10) + offset_px
-        elif style.position == "center":
-            y = (h - max_h) // 2 + offset_px
-        else:
-            y = int(h * 0.90) - max_h + offset_px
-
-        start_x = (w - total_w) // 2
-        cur_x = start_x
+        total_stack_h = sum(line_h for _, _, line_h in lines) + (len(lines) - 1) * line_gap
+        y_start = self._compute_y_base(style.position, style, total_stack_h, h, 0, w)
 
         highlight_color = self._hex_to_rgb(params["karaoke_highlight_color"])
         active_marker = params["classic_active_marker"]   # "color" | "box" | "color_box"
@@ -1416,15 +1892,18 @@ class VideoPreview(ctk.CTkFrame):
             overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
             ov_draw = ImageDraw.Draw(overlay)
             pad = 4
-            tmp_x = start_x
             bg_color = self._hex_to_rgb(style.background_color)
             opacity = int(style.background_opacity * 255)
-            for m in word_metrics:
-                ov_draw.rounded_rectangle(
-                    [tmp_x - pad, y - 2, tmp_x + m["w"] + pad, y + m["h"] + 2],
-                    radius=4, fill=(*bg_color, opacity),
-                )
-                tmp_x += m["w"] + space_w
+            y_line = y_start
+            for line_words, line_w, line_h in lines:
+                tmp_x = (w - line_w) // 2
+                for m in line_words:
+                    ov_draw.rounded_rectangle(
+                        [tmp_x - pad, y_line - 2, tmp_x + m["w"] + pad, y_line + m["h"] + 2],
+                        radius=4, fill=(*bg_color, opacity),
+                    )
+                    tmp_x += m["w"] + space_w
+                y_line += line_h + line_gap
             img = Image.alpha_composite(img, overlay)
             draw = ImageDraw.Draw(img)
 
@@ -1433,51 +1912,69 @@ class VideoPreview(ctk.CTkFrame):
             hl_overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
             hl_draw = ImageDraw.Draw(hl_overlay)
             pad = 5
-            tmp_x = start_x
-            for m in word_metrics:
-                is_active = current_time >= m["start"] and current_time < m["end"]
-                is_spoken = current_time >= m["end"]
-                if is_active:
-                    hl_draw.rounded_rectangle(
-                        [tmp_x - pad, y - 3, tmp_x + m["w"] + pad, y + m["h"] + 3],
-                        radius=5, fill=(*highlight_color, 180),
-                    )
-                elif is_spoken and history_on:
-                    hl_draw.rounded_rectangle(
-                        [tmp_x - pad, y - 3, tmp_x + m["w"] + pad, y + m["h"] + 3],
-                        radius=5, fill=(*highlight_color, 90),
-                    )
-                tmp_x += m["w"] + space_w
+            y_line = y_start
+            for line_words, line_w, line_h in lines:
+                tmp_x = (w - line_w) // 2
+                for m in line_words:
+                    is_active = current_time >= m["start"] and current_time < m["end"]
+                    is_spoken = current_time >= m["end"]
+                    if is_active:
+                        hl_draw.rounded_rectangle(
+                            [tmp_x - pad, y_line - 3, tmp_x + m["w"] + pad, y_line + m["h"] + 3],
+                            radius=5, fill=(*highlight_color, 180),
+                        )
+                    elif is_spoken and history_on:
+                        hl_draw.rounded_rectangle(
+                            [tmp_x - pad, y_line - 3, tmp_x + m["w"] + pad, y_line + m["h"] + 3],
+                            radius=5, fill=(*highlight_color, 90),
+                        )
+                    tmp_x += m["w"] + space_w
+                y_line += line_h + line_gap
             img = Image.alpha_composite(img, hl_overlay)
             draw = ImageDraw.Draw(img)
 
         _DIR8 = [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)]
+        fake_italic = getattr(font, '_fake_italic', False)
+        if fake_italic:
+            text_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(text_layer)
 
-        for m in word_metrics:
-            active = current_time >= m["start"] and current_time < m["end"]
-            spoken = current_time >= m["end"]
+        y_line = y_start
+        for line_words, line_w, line_h in lines:
+            cur_x = (w - line_w) // 2
+            for m in line_words:
+                active = current_time >= m["start"] and current_time < m["end"]
+                spoken = current_time >= m["end"]
 
-            if active:
-                color = highlight_color if use_color else base_color
-            elif spoken and history_on:
-                color = highlight_color if use_color else base_color
-            elif spoken:
-                color = base_color
-            else:
-                color = dimmed_color
-
-            if thickness > 0:
                 if active:
-                    t2 = thickness + 1
-                    for dx, dy in _DIR8:
-                        draw.text((cur_x + dx * t2, y + dy * t2), m["text"], font=font, fill=outline_color)
+                    color = highlight_color if use_color else base_color
+                elif spoken and history_on:
+                    color = highlight_color if use_color else base_color
+                elif spoken:
+                    color = base_color
                 else:
-                    for dx, dy in _DIR8:
-                        draw.text((cur_x + dx * thickness, y + dy * thickness), m["text"], font=font, fill=outline_color)
+                    color = dimmed_color
 
-            draw.text((cur_x, y), m["text"], font=font, fill=color)
-            cur_x += m["w"] + space_w
+                if thickness > 0:
+                    if active:
+                        t2 = thickness + 1
+                        for dx, dy in _DIR8:
+                            self._fb_text(draw, (cur_x + dx * t2, y_line + dy * t2), m["text"], font, outline_color)
+                    else:
+                        for dx, dy in _DIR8:
+                            self._fb_text(draw, (cur_x + dx * thickness, y_line + dy * thickness), m["text"], font, outline_color)
 
+                self._fb_text(draw, (cur_x, y_line), m["text"], font, color)
+                cur_x += m["w"] + space_w
+            y_line += line_h + line_gap
+
+        if fake_italic:
+            y_center = y_start + total_stack_h // 2
+            text_layer = self._shear_italic(text_layer, y_center)
+            img = Image.alpha_composite(img, text_layer)
+
+        primary_bottom_y = y_start + total_stack_h
+        img = self._draw_bilingual_translation(img, sub, params, primary_bottom_y=primary_bottom_y)
         return img if orig_mode == "RGBA" else img.convert(orig_mode)
 
     def _draw_karaoke_popup(self, img: Image.Image, sub, params: dict) -> Image.Image:
@@ -1496,6 +1993,23 @@ class VideoPreview(ctk.CTkFrame):
             result = self._draw_subtitle(img, sub, params)
             return result if orig_mode == "RGBA" else result.convert(orig_mode)
 
+        # Merge short words forward so each display group has at least this many chars.
+        _MIN_CHARS = params.get("popup_min_chars", 3)
+        merged: list[dict] = []
+        i = 0
+        while i < len(words):
+            group = words[i]
+            while len(group["word"].strip()) < _MIN_CHARS and i + 1 < len(words):
+                i += 1
+                group = {
+                    "word": group["word"] + " " + words[i]["word"],
+                    "start": group["start"],
+                    "end": words[i]["end"],
+                }
+            merged.append(group)
+            i += 1
+        words = merged
+
         current_word = None
         current_idx = -1
         for i, we in enumerate(words):
@@ -1511,45 +2025,70 @@ class VideoPreview(ctk.CTkFrame):
                     current_idx = i
                     break
             if current_word is None:
-                return img if orig_mode == "RGBA" else img.convert(orig_mode)
-
-        scale_mult = params["popup_scale"]
-        large_size = max(12, int(style.font_size * h / 1080 * scale_mult))
-        large_font = self._get_font(style, h, size_override=large_size)
+                # Past all word timestamps — hold the last word until subtitle ends.
+                sub_end = float(getattr(sub, "end", 0.0))
+                if words and current_time <= sub_end:
+                    current_word = words[-1]
+                    current_idx = len(words) - 1
+                else:
+                    return img if orig_mode == "RGBA" else img.convert(orig_mode)
 
         word_text = current_word["word"].strip()
         if not word_text:
             return img if orig_mode == "RGBA" else img.convert(orig_mode)
 
-        bbox = draw.textbbox((0, 0), word_text, font=large_font)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
+        large_size = int(style.font_size * h / 1080)
+        large_font = self._get_font(style, h, size_override=large_size, sample_text=word_text)
 
-        offset_px = int(h * getattr(style, "position_offset", 0) / 100)
-        x = (w - tw) // 2
-        if style.position == "top":
-            y = int(h * 0.12) + offset_px
-        elif style.position == "center":
-            y = (h - th) // 2 + offset_px
-        else:
-            y = int(h * 0.85) - th + offset_px
+        max_width = max(1, int(w * max(0, min(100, int(getattr(style, "text_width_percent", 90)))) / 100))
+        popup_lines = []
+        current_line = ""
+        for token in word_text.split():
+            test_line = token if not current_line else f"{current_line} {token}"
+            bbox = draw.textbbox((0, 0), test_line, font=large_font)
+            if (bbox[2] - bbox[0]) <= max_width or not current_line:
+                current_line = test_line
+            else:
+                lb = draw.textbbox((0, 0), current_line, font=large_font)
+                popup_lines.append((current_line, lb[2] - lb[0], lb[3] - lb[1]))
+                current_line = token
+        if current_line:
+            lb = draw.textbbox((0, 0), current_line, font=large_font)
+            popup_lines.append((current_line, lb[2] - lb[0], lb[3] - lb[1]))
+        if not popup_lines:
+            return img if orig_mode == "RGBA" else img.convert(orig_mode)
+
+        block_h = sum(line_h for _, _, line_h in popup_lines) + (len(popup_lines) - 1) * 2
+        y = self._compute_y_base(style.position, style, block_h, h, 0, w)
 
         _DIR8 = [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)]
         outline_color = self._hex_to_rgb(style.outline_color)
         thickness = style.outline_thickness
-        if thickness > 0:
-            for dx, dy in _DIR8:
-                draw.text(
-                    (x + dx * thickness, y + dy * thickness),
-                    word_text, font=large_font, fill=outline_color,
-                )
-
         text_color = self._hex_to_rgb(style.primary_color)
-        draw.text((x, y), word_text, font=large_font, fill=text_color)
+        fake_italic = getattr(large_font, '_fake_italic', False)
+        if fake_italic:
+            popup_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            popup_draw = ImageDraw.Draw(popup_layer)
+        else:
+            popup_draw = draw
+        y_line = y
+        for line_text, line_w, line_h in popup_lines:
+            x = (w - line_w) // 2
+            if thickness > 0:
+                for dx, dy in _DIR8:
+                    self._fb_text(popup_draw, (x + dx * thickness, y_line + dy * thickness),
+                                  line_text, large_font, outline_color)
+            self._fb_text(popup_draw, (x, y_line), line_text, large_font, text_color)
+            y_line += line_h + 2
+        if fake_italic:
+            popup_layer = self._shear_italic(popup_layer, y + block_h // 2)
+            img = Image.alpha_composite(img, popup_layer)
+            draw = ImageDraw.Draw(img)
 
         small_size = max(12, int(style.font_size * h / 1080 * 0.7))
-        small_font = self._get_font(style, h, size_override=small_size)
-        trail_y = y - int(th * 0.6)
+        small_font = self._get_font(style, h, size_override=small_size, sample_text=word_text)
+        first_line_h = popup_lines[0][2]
+        trail_y = y - int(first_line_h * 0.6)
 
         trail_count = params["popup_trail_count"]
         for offset in range(1, min(trail_count + 1, current_idx + 1)):
@@ -1569,12 +2108,18 @@ class VideoPreview(ctk.CTkFrame):
             px = (w - pw) // 2
             trail_y -= ph + 4
 
-            draw.text((px, trail_y), prev_word, font=small_font, fill=dimmed)
+            self._fb_text(draw, (px, trail_y), prev_word, small_font, dimmed)
 
+        primary_bottom_y = y + block_h
+        img = self._draw_bilingual_translation(img, sub, params, primary_bottom_y=primary_bottom_y)
         return img if orig_mode == "RGBA" else img.convert(orig_mode)
 
     def _draw_karaoke_word_by_word(self, img: Image.Image, sub, params: dict) -> Image.Image:
-        """Word-by-word mode: words appear one at a time building the full sentence."""
+        """Word-by-word mode: words appear one at a time building the full sentence.
+
+        History words render at history_dim opacity.  The newest word fades/pops
+        in independently — no full-frame blending, so history stays sharp.
+        """
         import math
         from types import SimpleNamespace
 
@@ -1588,64 +2133,150 @@ class VideoPreview(ctk.CTkFrame):
             return img
 
         entry_style = params["wordbyw_entry_style"]
-        history_style = params["wordbyw_history_style"]
-
-        def make_sub(word_list):
-            text = " ".join(w["word"] for w in word_list).strip()
-            if not text:
-                return None
-            return SimpleNamespace(
-                original_text=text,
-                translated_text=sub.translated_text if hasattr(sub, "translated_text") else None,
-                speaker_id=sub.speaker_id if hasattr(sub, "speaker_id") else None,
-                style_override=getattr(sub, "style_override", None),
-            )
+        history_dim = params.get("wordbyw_history_dim", 1.0)
+        orig_mode = img.mode
 
         newest = visible[-1]
         t_in = current_time - newest["start"]
         entry_dur = 0.15
 
-        full_sub = make_sub(visible)
-        prev_sub = make_sub(visible[:-1]) if len(visible) > 1 else None
-
-        orig_mode = img.mode
-
-        def render(base, s):
-            if s is None:
-                return base.copy()
-            return self._draw_subtitle(base.copy(), s, params)
-
-        def apply_history(base_img, rendered_img):
-            if history_style == "dimmed":
-                b = base_img.convert("RGBA")
-                r = rendered_img.convert("RGBA")
-                blended = Image.blend(b, r, 0.65)
-                return blended if orig_mode == "RGBA" else blended.convert(orig_mode)
-            return rendered_img
-
-        if entry_style == "instant":
-            return apply_history(img, render(img, full_sub))
-
         if entry_style == "fade":
-            alpha = min(1.0, t_in / entry_dur)
+            entry_alpha = min(1.0, t_in / entry_dur)
+        elif entry_style == "pop":
+            entry_alpha = min(1.0, math.sqrt(max(0.0, t_in / entry_dur)))
         else:
-            alpha = min(1.0, math.sqrt(max(0.0, t_in / entry_dur)))
+            entry_alpha = 1.0
 
-        if alpha >= 1.0:
-            return apply_history(img, render(img, full_sub))
+        style = params["style"]
+        base = img.convert("RGBA")
+        canvas_w, canvas_h = base.size
 
-        prev_rendered = render(img, prev_sub)
-        full_rendered = render(img, full_sub)
+        # history hidden: show only the newest word (use _draw_subtitle for glow/shadow)
+        if history_dim <= 0.0:
+            ns = SimpleNamespace(
+                original_text=newest["word"],
+                translated_text=getattr(sub, "translated_text", None),
+                style_override=getattr(sub, "style_override", None),
+            )
+            rendered = self._draw_subtitle(base.copy(), ns, params).convert("RGBA")
+            if entry_alpha >= 1.0:
+                return rendered if orig_mode == "RGBA" else rendered.convert(orig_mode)
+            result = Image.blend(base, rendered, entry_alpha)
+            return result if orig_mode == "RGBA" else result.convert(orig_mode)
 
-        if history_style == "dimmed":
-            prev_final = Image.blend(img.convert("RGBA"), prev_rendered.convert("RGBA"), 0.65)
-            full_final = Image.blend(img.convert("RGBA"), full_rendered.convert("RGBA"), 0.65)
-        else:
-            prev_final = prev_rendered.convert("RGBA")
-            full_final = full_rendered.convert("RGBA")
+        full_text = " ".join(w["word"] for w in visible)
 
-        blended = Image.blend(prev_final, full_final, alpha)
-        return blended if orig_mode == "RGBA" else blended.convert(orig_mode)
+        # Compute layout from full text — this anchors the centring for ALL frames
+        # so history words never shift position as new words are appended.
+        meas_draw = ImageDraw.Draw(base)
+        font, lines, _, block_h = self._prepare_text_block(
+            meas_draw, full_text, style, canvas_w, canvas_h
+        )
+        y_start = self._compute_y_base(style.position, style, block_h, canvas_h, 0, canvas_w)
+
+        new_word_str = newest["word"].strip()
+        oc = self._hex_to_rgb(style.outline_color)
+        fc = self._hex_to_rgb(style.primary_color)
+        thickness = style.outline_thickness
+        _DIR8 = [(-1,-1),(0,-1),(1,-1),(-1,0),(1,0),(-1,1),(0,1),(1,1)]
+
+        glow_enabled = getattr(style, "glow_enabled", False)
+        glow_color = self._hex_to_rgb(getattr(style, "glow_color", "#FFFFFF"))
+        glow_radius = max(8, getattr(style, "glow_radius", 8))
+        shadow_enabled = getattr(style, "shadow_enabled", False)
+        shadow_sc = self._hex_to_rgb(getattr(style, "shadow_color", "#000000"))
+        shadow_sx = getattr(style, "shadow_offset_x", 2)
+        shadow_sy = getattr(style, "shadow_offset_y", 2)
+        shadow_blur = getattr(style, "shadow_blur", 0)
+
+        # Draw a text segment (shadow + glow + outline + fill) onto text_layer at seg_alpha.
+        fake_bold = getattr(font, '_fake_bold', False)
+
+        def _fb_seg(d, xy, txt, fnt, clr):
+            """draw.text with fake-bold for word-by-word segments."""
+            d.text(xy, txt, font=fnt, fill=clr)
+            if fake_bold:
+                d.text((xy[0] + 1, xy[1]), txt, font=fnt, fill=clr)
+
+        def draw_seg(text, x, y, seg_alpha):
+            a = int(max(0, min(1.0, seg_alpha)) * 255)
+            if a == 0:
+                return
+
+            # Shadow
+            if shadow_enabled:
+                sh_layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+                sh_draw = ImageDraw.Draw(sh_layer)
+                _fb_seg(sh_draw, (x + shadow_sx, y + shadow_sy), text, font,
+                        (*shadow_sc, int(a * 220 / 255)))
+                if shadow_blur > 0:
+                    sh_layer = sh_layer.filter(ImageFilter.GaussianBlur(shadow_blur))
+                text_layer.alpha_composite(sh_layer)
+
+            # Glow — outer halo only, letter counters filled, alpha amplified
+            if glow_enabled:
+                tm = Image.new("L", base.size, 0)
+                glow_draw = ImageDraw.Draw(tm)
+                glow_draw.text((x, y), text, font=font, fill=255)
+                if fake_bold:
+                    glow_draw.text((x + 1, y), text, font=font, fill=255)
+                fill_blur = max(3, glow_radius // 2)
+                filled_tm = tm.filter(ImageFilter.GaussianBlur(fill_blur))
+                filled_tm = filled_tm.point(lambda p: 255 if p > 20 else 0)
+                outer_a = ImageChops.subtract(
+                    tm.filter(ImageFilter.GaussianBlur(glow_radius)), filled_tm
+                )
+                outer_a = outer_a.point(lambda p: min(255, int(p * 2 * seg_alpha)))
+                gl_layer = Image.merge("RGBA", (
+                    Image.new("L", base.size, glow_color[0]),
+                    Image.new("L", base.size, glow_color[1]),
+                    Image.new("L", base.size, glow_color[2]),
+                    outer_a,
+                ))
+                text_layer.alpha_composite(gl_layer)
+
+            # Outline + fill
+            td = ImageDraw.Draw(text_layer)
+            if thickness > 0:
+                for dx, dy in _DIR8:
+                    _fb_seg(td, (x + dx * thickness, y + dy * thickness),
+                            text, font, (*oc, a))
+            _fb_seg(td, (x, y), text, font, (*fc, a))
+
+        # Single RGBA layer for all text; history at history_dim, newest at entry_alpha.
+        text_layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+
+        cur_y = y_start
+        for line_idx, (line_text, line_w, line_h) in enumerate(lines):
+            line_x = (canvas_w - line_w) // 2
+            is_last = (line_idx == len(lines) - 1)
+
+            if not is_last:
+                draw_seg(line_text, line_x, cur_y, history_dim)
+            else:
+                if new_word_str and line_text.endswith(new_word_str):
+                    pre = line_text[:len(line_text) - len(new_word_str)].rstrip()
+                    if pre:
+                        draw_seg(pre, line_x, cur_y, history_dim)
+                        pre_adv = (
+                            meas_draw.textbbox((0, 0), pre + " ", font=font)[2]
+                            - meas_draw.textbbox((0, 0), pre + " ", font=font)[0]
+                        )
+                        new_x = line_x + pre_adv
+                    else:
+                        new_x = line_x
+                    draw_seg(new_word_str, new_x, cur_y, entry_alpha)
+                else:
+                    draw_seg(line_text, line_x, cur_y, history_dim)
+
+            cur_y += line_h + 2
+
+        if getattr(font, '_fake_italic', False):
+            text_layer = self._shear_italic(text_layer, y_start + block_h // 2)
+        result = Image.alpha_composite(base, text_layer)
+        primary_bottom_y = y_start + block_h
+        result = self._draw_bilingual_translation(result, sub, params, primary_bottom_y=primary_bottom_y)
+        return result if orig_mode == "RGBA" else result.convert(orig_mode)
 
     def _get_karaoke_words(self, sub) -> list[dict]:
         if getattr(sub, "words", None):
@@ -1671,20 +2302,61 @@ class VideoPreview(ctk.CTkFrame):
             fallback.append({"word": token, "start": w_start, "end": w_end})
         return fallback
 
+    @staticmethod
+    def _tokenize_for_wrap(text: str) -> list[str]:
+        """Split text into wrap-friendly tokens.
+
+        Splits text into tokens for width-based wrapping.  Each token is a
+        (text, needs_space_before) tuple.
+
+        - Latin/spaced words become one token each with space separators.
+        - CJK characters become individual tokens with no separator, allowing
+          line breaks at any character boundary.
+        - Mixed text (e.g. "Hello 你好世界 test") handles both correctly.
+        """
+        import unicodedata
+
+        def _is_cjk(ch: str) -> bool:
+            return unicodedata.category(ch).startswith("Lo")
+
+        tokens = []  # list of (text, needs_space_before)
+        for i, word in enumerate(text.split()):
+            space = i > 0  # space before this word group
+            # Check if word contains any CJK
+            if any(_is_cjk(ch) for ch in word):
+                buf = ""
+                for ch in word:
+                    if _is_cjk(ch):
+                        if buf:
+                            tokens.append((buf, space))
+                            space = False
+                            buf = ""
+                        tokens.append((ch, space))
+                        space = False
+                    else:
+                        buf += ch
+                if buf:
+                    tokens.append((buf, space))
+            else:
+                tokens.append((word, space))
+        return tokens
+
     def _prepare_text_block(self, draw: ImageDraw.Draw, text: str, style: SubtitleStyle,
                             img_w: int, img_h: int, scale: float = 1.0):
-        font = self._get_font(style, img_h, scale=scale)
+        font = self._get_font(style, img_h, scale=scale, sample_text=text)
 
-        max_width = int(img_w * 0.85)
+        width_pct = max(0, min(100, int(getattr(style, "text_width_percent", 90))))
+        max_width = max(1, int(img_w * width_pct / 100))
         lines = []
-        words = text.split()
+        tokens = self._tokenize_for_wrap(text)
 
-        if not words:
+        if not tokens:
             return font, [], 0, 0
 
         current_line = ""
-        for word in words:
-            test_line = current_line + (" " if current_line else "") + word
+        for token_text, needs_space in tokens:
+            sep = " " if needs_space and current_line else ""
+            test_line = current_line + sep + token_text
             bbox = draw.textbbox((0, 0), test_line, font=font)
             if (bbox[2] - bbox[0]) <= max_width:
                 current_line = test_line
@@ -1692,7 +2364,7 @@ class VideoPreview(ctk.CTkFrame):
                 if current_line:
                     l_bbox = draw.textbbox((0, 0), current_line, font=font)
                     lines.append((current_line, l_bbox[2] - l_bbox[0], l_bbox[3] - l_bbox[1]))
-                current_line = word
+                current_line = token_text
 
         if current_line:
             l_bbox = draw.textbbox((0, 0), current_line, font=font)
@@ -1702,6 +2374,86 @@ class VideoPreview(ctk.CTkFrame):
         block_w = max(l[1] for l in lines) if lines else 0
 
         return font, lines, block_w, block_h
+
+    def _draw_safe_width_guide(self, img: Image.Image, style: SubtitleStyle, alpha: float = 1.0) -> Image.Image:
+        """Draw temporary shaded side regions indicating active subtitle width barrier."""
+        width_pct = max(0, min(100, int(getattr(style, "text_width_percent", 90))))
+        if width_pct >= 100:
+            return img
+
+        w, h = img.size
+        safe_w = max(1, int(w * width_pct / 100))
+        left = max(0, (w - safe_w) // 2)
+        right = min(w, left + safe_w)
+
+        orig_mode = img.mode
+        alpha = max(0.0, min(1.0, float(alpha)))
+
+        if orig_mode == "RGBA":
+            # mpv overlay path — colorkey transparency is binary so we use a
+            # stipple pattern to simulate semi-transparency.
+            # ~67% of pixels are dark, giving roughly 60% visual opacity.
+            import numpy as np
+            arr = np.array(img)
+            # Stipple pattern: ~60% of pixels are fully-opaque black dots,
+            # the rest stay transparent.  After colorkey compositing the dots
+            # survive (RGB 0,0,0 != colorkey 1,1,1) while gaps become the
+            # colorkey colour and disappear, letting the video show through.
+            yy, xx = np.ogrid[:h, :w]
+            checker = ((xx + yy) % 3 != 0)  # ~67% of pixels
+
+            # Apply density based on fade-in alpha (fewer dots when fading in)
+            if alpha < 1.0:
+                # Thin out the pattern during fade: use a sparser grid
+                checker = checker & (((xx * 7 + yy * 13) % 100) < int(alpha * 100))
+
+            # Shade regions — dots are fully opaque black (survives colorkey)
+            if left > 0:
+                mask = checker[:, :left]
+                arr[:h, :left, 0] = np.where(mask, 0, arr[:h, :left, 0])
+                arr[:h, :left, 1] = np.where(mask, 0, arr[:h, :left, 1])
+                arr[:h, :left, 2] = np.where(mask, 0, arr[:h, :left, 2])
+                arr[:h, :left, 3] = np.where(mask, 255, arr[:h, :left, 3])
+            if right < w:
+                mask = checker[:, :w - right]
+                arr[:h, right:, 0] = np.where(mask, 0, arr[:h, right:, 0])
+                arr[:h, right:, 1] = np.where(mask, 0, arr[:h, right:, 1])
+                arr[:h, right:, 2] = np.where(mask, 0, arr[:h, right:, 2])
+                arr[:h, right:, 3] = np.where(mask, 255, arr[:h, right:, 3])
+
+            # Border lines (solid, fully opaque white, 2px wide)
+            if left > 0:
+                x0, x1 = max(0, left - 1), min(w, left + 1)
+                arr[:, x0:x1, 0] = 255
+                arr[:, x0:x1, 1] = 255
+                arr[:, x0:x1, 2] = 255
+                arr[:, x0:x1, 3] = 255
+            if right < w:
+                x0, x1 = max(0, right - 1), min(w, right + 1)
+                arr[:, x0:x1, 0] = 255
+                arr[:, x0:x1, 1] = 255
+                arr[:, x0:x1, 2] = 255
+                arr[:, x0:x1, 3] = 255
+
+            return Image.fromarray(arr, "RGBA")
+
+        # Fallback (RGB) path — normal alpha compositing works fine
+        base = img.convert("RGBA")
+        overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        shadow_alpha = int(35 * alpha)
+        line_alpha = int(95 * alpha)
+
+        if left > 0:
+            draw.rectangle([0, 0, left, h], fill=(0, 0, 0, shadow_alpha))
+            draw.line([(left, 0), (left, h)], fill=(255, 255, 255, line_alpha), width=2)
+        if right < w:
+            draw.rectangle([right, 0, w, h], fill=(0, 0, 0, shadow_alpha))
+            draw.line([(right, 0), (right, h)], fill=(255, 255, 255, line_alpha), width=2)
+
+        result = Image.alpha_composite(base, overlay)
+        return result.convert(orig_mode)
 
     def _hex_to_rgb(self, hex_color: str) -> tuple:
         hex_color = hex_color.lstrip("#")
